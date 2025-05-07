@@ -24,13 +24,13 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install GStatSim
         run: |
-          pip install "numpy<=1.23.4"
+          pip install "numpy<2"
           pip install -e .
           pip install pytest pytest-cov
       - name: Run tests
         run: pytest --cov=gstatsim --cov-report=html
       - name: Upload coverage report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: ./htmlcov/

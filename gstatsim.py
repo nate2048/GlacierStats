@@ -10,6 +10,7 @@ import sklearn as sklearn
 from sklearn.neighbors import KDTree
 import math
 from scipy.spatial import distance_matrix
+from scipy.special import kv, gamma
 from scipy.interpolate import Rbf
 from tqdm import tqdm
 import random
@@ -327,6 +328,9 @@ class NearestNeighbor:
             for j, row in enumerate(octant):
                 smallest[i*oct_count+j,:] = row 
         near = smallest[~np.isnan(smallest)].reshape(-1,3) 
+
+        if near.shape[0] == 0:
+            raise ValueError('Unable to find nearest neighbors. Try increasing search radiuis')
         
         return near
     
@@ -374,7 +378,10 @@ class NearestNeighbor:
             octant = data[data.Oct == i].iloc[:oct_count][['X','Y','Z']].values
             for j, row in enumerate(octant):
                 smallest[i*oct_count+j,:] = row 
-        near = smallest[~np.isnan(smallest)].reshape(-1,3) 
+        near = smallest[~np.isnan(smallest)].reshape(-1,3)
+
+        if near.shape[0] == 0:
+            raise ValueError('Unable to find nearest neighbors. Try increasing search radiuis')
         
         return near, cluster_number
 
@@ -573,7 +580,7 @@ def make_rotation_matrix(azimuth, major_range, minor_range):
 
 class Covariance:
     
-    def covar(effective_lag, sill, nug, vtype):
+    def covar(effective_lag, sill, nug, vtype, s=None):
         """
         Compute covariance
         
@@ -586,7 +593,9 @@ class Covariance:
             nug : int, float
                 nugget of variogram
             vtype : string
-                type of variogram model (Exponential, Gaussian, or Spherical)
+                type of variogram model (Exponential, Gaussian, Spherical, or Matern)
+            s : float
+                smoothness for Matern covariance
         Raises
         ------
         AtrributeError : if vtype is not 'Exponential', 'Gaussian', or 'Spherical'
@@ -604,8 +613,13 @@ class Covariance:
         elif vtype.lower() == 'spherical':
             c = sill - nug - 1.5 * effective_lag + 0.5 * np.power(effective_lag, 3)
             c[effective_lag > 1] = sill - 1
+        elif vtype.lower() == 'matern':
+            scale = 0.45246434*np.exp(-0.70449189*s)+1.7863836
+            effective_lag[effective_lag==0.0] = 1e-8
+            c = (sill-nug)*2/gamma(s)*np.power(scale*effective_lag*np.sqrt(s), s)*kv(s, 2*scale*effective_lag*np.sqrt(s))
+            c[np.isnan(c)] = sill-nug
         else: 
-            raise AttributeError(f"vtype must be 'Exponential', 'Gaussian', or 'Spherical'")
+            raise AttributeError(f"vtype must be 'Exponential', 'Gaussian', 'Spherical', or Matern")
         return c
 
     def make_covariance_matrix(coord, vario, rotation_matrix):
@@ -632,9 +646,16 @@ class Covariance:
         nug = vario[1]
         sill = vario[4]  
         vtype = vario[5]
+        if vtype.lower() == 'matern':
+            if len(vario) < 7:
+                raise ValueError("smoothness s must be specified for Matern covariance")
+            else:
+                s = vario[6]
+        else:
+            s = None
         mat = np.matmul(coord, rotation_matrix)
-        effective_lag = pairwise_distances(mat,mat) 
-        covariance_matrix = Covariance.covar(effective_lag, sill, nug, vtype)
+        effective_lag = pairwise_distances(mat,mat)
+        covariance_matrix = Covariance.covar(effective_lag, sill, nug, vtype, s=s)
 
         return covariance_matrix
 
@@ -663,10 +684,17 @@ class Covariance:
         nug = vario[1]
         sill = vario[4]
         vtype = vario[5]
+        if vtype.lower() == 'matern':
+            if len(vario) < 7:
+                raise ValueError("smoothness s must be specified for Matern covariance")
+            else:
+                s = vario[6]
+        else:
+            s = None
         mat1 = np.matmul(coord1, rotation_matrix) 
         mat2 = np.matmul(coord2.reshape(-1,2), rotation_matrix) 
         effective_lag = np.sqrt(np.square(mat1 - mat2).sum(axis=1))
-        covariance_array = Covariance.covar(effective_lag, sill, nug, vtype)
+        covariance_array = Covariance.covar(effective_lag, sill, nug, vtype, s=s)
 
         return covariance_array
 
@@ -857,7 +885,7 @@ class Interpolation:
                 var_ok[z] = 0   
         return est_ok, var_ok
   
-    def skrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, quiet=False):
+    def skrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, seed=None, quiet=False):
         """
         Sequential Gaussian simulation using simple kriging 
         
@@ -881,6 +909,9 @@ class Interpolation:
                 vtype is a string that can be either 'Exponential', 'Spherical', or 'Gaussian'
             radius : int, float
                 search radius
+            seed : None (default), integer or numpy.random._generator.Generator
+                integer seed for random number generator or instance of it. Default is None in
+                which case a random seed will be used
             quiet : bool
                 If False, a progress bar will be printed to the console.
                Default is False
@@ -890,6 +921,9 @@ class Interpolation:
             sgs : numpy.ndarray
                 simulated value for each coordinate in prediction_grid
         """
+
+        # make random number generator if not provided
+        rng = get_random_generator(seed)
 
         # unpack variogram parameters
         azimuth = vario[0]
@@ -906,8 +940,8 @@ class Interpolation:
 
         df = df.rename(columns = {xx: 'X', yy: 'Y', zz: 'Z'})
         xyindex = np.arange(len(prediction_grid)) 
-        random.shuffle(xyindex)
-        mean_1 = df['Z'].mean() 
+        rng.shuffle(xyindex)
+        mean_1 = df['Z'].mean()
         var_1 = vario[4]
         sgs = np.zeros(shape=len(prediction_grid)) 
 
@@ -937,7 +971,7 @@ class Interpolation:
                 est = mean_1 + np.sum(k_weights*(norm_data_val - mean_1)) 
                 var = var_1 - np.sum(k_weights*covariance_array) 
                 var = np.absolute(var) 
-                sgs[z] = np.random.normal(est,math.sqrt(var),1) 
+                sgs[z] = rng.normal(est,math.sqrt(var),1) 
             else:
                 sgs[z] = df['Z'].values[np.where(test_idx==2)[0][0]]
 
@@ -947,7 +981,7 @@ class Interpolation:
 
         return sgs
    
-    def okrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, quiet=False):
+    def okrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, seed=None, quiet=False):
         """
         Sequential Gaussian simulation using ordinary kriging 
         
@@ -971,6 +1005,9 @@ class Interpolation:
                 vtype is a string that can be either 'Exponential', 'Spherical', or 'Gaussian'
             radius : int, float
                 search radius
+            seed : None (default), integer or numpy.random._generator.Generator
+                integer seed for random number generator or instance of it. Default is None in
+                which case a random seed will be used
             quiet : bool
                 If False, a progress bar will be printed to the console.
                Default is False
@@ -980,6 +1017,9 @@ class Interpolation:
             sgs : numpy.ndarray
                 simulated value for each coordinate in prediction_grid
         """
+
+        # make random number generator if not provided
+        rng = get_random_generator(seed)
 
         # unpack variogram parameters
         azimuth = vario[0]
@@ -996,7 +1036,7 @@ class Interpolation:
 
         df = df.rename(columns = {xx: "X", yy: "Y", zz: "Z"}) 
         xyindex = np.arange(len(prediction_grid)) 
-        random.shuffle(xyindex)
+        rng.shuffle(xyindex)
         var_1 = vario[4]
         sgs = np.zeros(shape=len(prediction_grid))  
 
@@ -1035,7 +1075,7 @@ class Interpolation:
                 var = var_1 - np.sum(k_weights[0:new_num_pts]*covariance_array[0:new_num_pts]) 
                 var = np.absolute(var)
 
-                sgs[z] = np.random.normal(est,math.sqrt(var),1) 
+                sgs[z] = rng.normal(est,math.sqrt(var),1) 
             else:
                 sgs[z] = df['Z'].values[np.where(test_idx==2)[0][0]] 
 
@@ -1045,7 +1085,7 @@ class Interpolation:
         return sgs
 
 
-    def cluster_sgs(prediction_grid, df, xx, yy, zz, kk, num_points, df_gamma, radius, quiet=False):
+    def cluster_sgs(prediction_grid, df, xx, yy, zz, kk, num_points, df_gamma, radius, seed=None, quiet=False):
         """
         Sequential Gaussian simulation where variogram parameters are different for each k cluster. Uses simple kriging 
         
@@ -1071,6 +1111,9 @@ class Interpolation:
                 vtype is a string that can be either 'Exponential', 'Spherical', or 'Gaussian'
             radius : int, float
                 search radius
+            seed : None (default), integer or numpy.random._generator.Generator
+                integer seed for random number generator or instance of it. Default is None in
+                which case a random seed will be used
             quiet : bool
                 If False, a progress bar will be printed to the console.
                Default is False
@@ -1081,6 +1124,9 @@ class Interpolation:
                 simulated value for each coordinate in prediction_grid
         """
 
+        # make random number generator if not provided
+        rng = get_random_generator(seed)
+
         if 'X' in df.columns and xx != 'X':
             df = df.drop(columns=['X'])
         if 'Y' in df.columns and yy != 'Y':
@@ -1090,7 +1136,7 @@ class Interpolation:
 
         df = df.rename(columns = {xx: "X", yy: "Y", zz: "Z", kk: "K"})  
         xyindex = np.arange(len(prediction_grid)) 
-        random.shuffle(xyindex)
+        rng.shuffle(xyindex)
         mean_1 = np.average(df["Z"].values) 
         sgs = np.zeros(shape=len(prediction_grid)) 
 
@@ -1133,7 +1179,7 @@ class Interpolation:
                 var = var_1 - np.sum(k_weights*covariance_array)
                 var = np.absolute(var) 
 
-                sgs[z] = np.random.normal(est,math.sqrt(var),1) 
+                sgs[z] = rng.normal(est,math.sqrt(var),1)
             else:
                 sgs[z] = df['Z'].values[np.where(test_idx==2)[0][0]]
                 cluster_number = df['K'].values[np.where(test_idx==2)[0][0]]
@@ -1272,7 +1318,7 @@ class Interpolation:
 
         return est_cokrige, var_cokrige
 
-    def cosim_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_points, vario, radius, corrcoef, quiet=False):
+    def cosim_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_points, vario, radius, corrcoef, seed=None, quiet=False):
         """
         Cosimulation under Markov model 1 assumptions
         
@@ -1306,6 +1352,9 @@ class Interpolation:
                 search radius
             corrcoef : float
                 correlation coefficient between primary and secondary data
+            seed : None (default), integer or numpy.random._generator.Generator
+                integer seed for random number generator or instance of it. Default is None in
+                which case a random seed will be used
             quiet : bool
                 If False, a progress bar will be printed to the console.
                Default is False
@@ -1315,6 +1364,8 @@ class Interpolation:
             cosim : numpy.ndarray
                 cosimulation for each point in coordinate grid
         """
+        # make random number generator if not provided
+        rng = get_random_generator(seed)
             
         # unpack variogram parameters
         azimuth = vario[0]
@@ -1339,7 +1390,7 @@ class Interpolation:
         df1 = df1.rename(columns = {xx1: "X", yy1: "Y", zz1: "Z"}) 
         df2 = df2.rename(columns = {xx2: "X", yy2: "Y", zz2: "Z"})
         xyindex = np.arange(len(prediction_grid)) 
-        random.shuffle(xyindex)
+        rng.shuffle(xyindex)
 
         mean_1 = np.average(df1['Z']) 
         var_1 = np.var(df1['Z']) # replaced var_1 = vario[4]
@@ -1396,7 +1447,7 @@ class Interpolation:
                 var_cokrige = var_1 - np.sum(k_weights*covariance_array)
                 var_cokrige = np.absolute(var_cokrige) 
 
-                cosim[z] = np.random.normal(est_cokrige,math.sqrt(var_cokrige),1) 
+                cosim[z] = rng.normal(est_cokrige,math.sqrt(var_cokrige),1)
             else:
                 cosim[z] = df1['Z'].values[np.where(test_idx==2)[0][0]]
 
@@ -1405,8 +1456,24 @@ class Interpolation:
 
         return cosim
 
+def get_random_generator(seed):
+    """
+    Conveniance function to get numpy random number generator for SGS. If seed is None, a random
+    seed is used. If seed is an integer, that integer is used to seed the RNG. If seed is
+    already an instance of a numpy RNG that is returned.
+    """
+    if seed is None:
+        rng = np.random.default_rng()
+    elif isinstance(seed, int):
+        rng = np.random.default_rng(seed=seed)
+    elif isinstance(seed, np.random._generator.Generator):
+        rng = seed
+    else:
+        raise ValueError('Seed should be an integer, a NumPy random Generator, or None')
+    return rng
+
 __all__ = ['Gridding', 'NearestNeighbor', 'Covariance', 'Interpolation', 'rbf_trend', 
-    'adaptive_partitioning', 'make_rotation_matrix']
+    'adaptive_partitioning', 'make_rotation_matrix', 'get_random_generator']
 
 def __dir__():
     return __all__
