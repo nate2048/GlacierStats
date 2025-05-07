@@ -8,7 +8,6 @@ import gstatsim as gs
 import math
 import random
 import itertools
-import time
 import sys
 
 ##########################
@@ -16,13 +15,13 @@ import sys
 
 def skrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes):
 
-    # Seperate observed data with data to predict
+    # seperate observed data with data to predict
     observed_coords = df[[xx, yy]].values.tolist()
     simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
  
     mean = df[zz].mean()
 
-    # create iterable parameter list
+    # create iterable parameter list for parameters to be used for function executed in parallel
     i = [i for i in range(len(simulate_coords))]
     args = zip(i, itertools.cycle([simulate_coords]), itertools.cycle([df[[xx, yy, zz]].to_numpy()]), itertools.cycle([mean]),
                itertools.cycle([vario]), itertools.cycle([radius]), itertools.cycle([num_points]), itertools.cycle(['s']))
@@ -31,11 +30,13 @@ def skrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, pr
 
     est_sk = np.zeros(shape=len(simulate_coords)) 
     var_sk = np.zeros(shape=len(simulate_coords))
+
+    # use python multiprocessing library to execute parallel_krige function in parallel
     out = pool.starmap(parallel_krige, args, chunksize=200)
 
+    # aggregate output into a dictionary to look up data by index
     for (idx, est_sk_out, var_sk_out) in out:
         
-        # aggregate output into a dictionary to look up data by index
         est_sk[idx] = est_sk_out
         var_sk[idx] = var_sk_out
 
@@ -45,6 +46,7 @@ def skrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, pr
     full[len(df):, 2] = est_sk
     full[len(df):, 3] = var_sk
     
+    # reorder output to match that of the serialized implimentation
     full = full[np.lexsort((full[:,0], -full[:,1]))]
 
     return full[:,2], full[:,3]
@@ -52,13 +54,13 @@ def skrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, pr
 
 def okrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes):
 
-    # Seperate observed data with data to predict
+    # seperate observed data with data to predict
     observed_coords = df[[xx, yy]].values.tolist()
     simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
  
     mean = df[zz].mean()
 
-    # create iterable parameter list
+    # create iterable parameter list for parameters to be used for function executed in parallel
     i = [i for i in range(len(simulate_coords))]
     args = zip(i, itertools.cycle([simulate_coords]), itertools.cycle([df[[xx, yy, zz]].to_numpy()]), itertools.cycle([mean]),
                itertools.cycle([vario]), itertools.cycle([radius]), itertools.cycle([num_points]), itertools.cycle(['o']))
@@ -67,11 +69,13 @@ def okrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, pr
 
     est_sk = np.zeros(shape=len(simulate_coords)) 
     var_sk = np.zeros(shape=len(simulate_coords))
+
+    # use python multiprocessing library to execute parallel_krige function in parallel
     out = pool.starmap(parallel_krige, args, chunksize=200)
 
+    # aggregate output into a dictionary to look up data by index
     for (idx, est_sk_out, var_sk_out) in out:
         
-        # aggregate output into a dictionary to look up data by index
         est_sk[idx] = est_sk_out
         var_sk[idx] = var_sk_out
 
@@ -81,6 +85,7 @@ def okrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, pr
     full[len(df):, 2] = est_sk
     full[len(df):, 3] = var_sk
     
+    # reorder output to match that of the serialized implimentation
     full = full[np.lexsort((full[:,0], -full[:,1]))]
 
     return full[:,2], full[:,3]
@@ -99,23 +104,27 @@ def skrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, proce
     # create starting index for data from full to use for KNN
     begin = len(observed_coords)
 
-    # create iterable parameter list
+    # create iterable parameter list for parameters to be used for function executed in parallel
     i = [i for i in range(len(simulate_coords))]
     args = zip(i, itertools.cycle([full]), itertools.cycle([vario]), itertools.cycle([radius]),
                itertools.cycle([num_points]), itertools.cycle([begin]), itertools.cycle(['s']))
 
     pool = mp.Pool(processes)
-    start = time.time()
+    
     kr_dictionary = {}
+    
+    # use python multiprocessing library to execute parallel_krige_sgs function in parallel
     out = pool.starmap(parallel_krige_sgs, args, chunksize=200)
 
+    # aggregate output into a dictionary to look up data by index
     for (idx, weights, covariance_array, indicies) in out:
         
-        # aggregate output into a dictionary to look up data by index
         kr_dictionary[idx] = (weights, covariance_array, indicies)
     
+    # use kriging weights to stochastically estimate the bed elevation
     sgs = pred_Z(kr_dictionary, full, df[zz], vario, 's')
     
+    # reorder output to match that of the serialized implimentation
     sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
     return sgs[:,2]
@@ -134,32 +143,36 @@ def okrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, proce
     # create starting index for data from full to use for KNN
     begin = len(observed_coords)
 
-    # create iterable parameter list
+    # create iterable parameter list for parameters to be used for function executed in parallel
     i = [i for i in range(len(simulate_coords))]
     args = zip(i, itertools.cycle([full]), itertools.cycle([vario]), itertools.cycle([radius]),
                itertools.cycle([num_points]), itertools.cycle([begin]), itertools.cycle(['o']))
 
     pool = mp.Pool(processes)
-    start = time.time()
+
     kr_dictionary = {}
+
+    # use python multiprocessing library to execute parallel_krige_sgs function in parallel
     out = pool.starmap(parallel_krige_sgs, args, chunksize=200)
 
+    # aggregate output into a dictionary to look up data by index
     for (idx, weights, covariance_array, indicies) in out:
         
-        # aggregate output into a dictionary to look up data by index
         kr_dictionary[idx] = (weights, covariance_array, indicies)
     
+    # use kriging weights to stochastically estimate the bed elevation
     sgs = pred_Z(kr_dictionary, full, df[zz], vario, 'o')
     
+    # reorder output to match that of the serialized implimentation
     sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
     return sgs[:,2]
 
 
-def cluster_sgs(prediction_grid, df, num_points, gamma, radius, processes):
+def cluster_sgs(prediction_grid, df, xx, yy, zz, kk, num_points, gamma, radius, processes):
 
     # Seperate observed data with data to predict
-    observed_coords = df[['X', 'Y']].values.tolist()
+    observed_coords = df[[xx, yy]].values.tolist()
     simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
 
     # Shuffle data to predict to create a random path
@@ -170,12 +183,12 @@ def cluster_sgs(prediction_grid, df, num_points, gamma, radius, processes):
     # add column for cluster number
     new_col = np.ones((len(full), 1)) * np.nan
     full = np.hstack((full, new_col))
-    full[:len(df),2] = df[['K']].squeeze()
+    full[:len(df),2] = df[[kk]].squeeze()
 
     # create starting index for data from full to use for KNN
     begin = len(observed_coords)
 
-    # create iterable parameter list
+    # create iterable parameter list for parameters to be used for function executed in parallel
     i = [i for i in range(len(simulate_coords))]
     args = zip(i, itertools.cycle([full]), itertools.cycle([gamma]), itertools.cycle([radius]),
                itertools.cycle([num_points]), itertools.cycle([begin]))
@@ -183,15 +196,18 @@ def cluster_sgs(prediction_grid, df, num_points, gamma, radius, processes):
     pool = mp.Pool(processes)
 
     kr_dictionary = {}
+
+    # use python multiprocessing library to execute parallel_cluster_sgs function in parallel
     out = pool.starmap(parallel_cluster_sgs, args, chunksize=200)
 
+    # aggregate output into a dictionary to look up data by index
     for (idx, weights, covariance_array, indicies, cluster_num) in out:
         
-        # aggregate output into a dictionary to look up data by index
         kr_dictionary[idx] = (weights, covariance_array, indicies, cluster_num)
     
-    sgs = pred_Z_cluster(kr_dictionary, full, df, gamma)
+    sgs = pred_Z_cluster(kr_dictionary, full, df[zz], gamma)
     
+    # reorder output to match that of the serialized implimentation
     sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
     return sgs[:, 3]
@@ -204,12 +220,12 @@ def cokrige_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_poi
     simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
 
     mean_1 = np.average(df1[zz1]) 
-    var_1 = np.var(df1[zz1]) # replaced var_1 = vario[4]
+    var_1 = np.var(df1[zz1])
     vario[4] = np.var(df1[zz1]) 
     mean_2 = np.average(df2[zz2]) 
     var_2 = np.var(df2[zz2])
 
-    # create iterable parameter list
+    # create iterable parameter list for parameters to be used for function executed in parallel
     i = [i for i in range(len(simulate_coords))]
     args = zip(i, itertools.cycle([simulate_coords]), itertools.cycle([df1[[xx1, yy1, zz1]].to_numpy()]), itertools.cycle([mean_1]), itertools.cycle([var_1]),
                itertools.cycle([df2[[xx2, yy2, zz2]].to_numpy()]), itertools.cycle([mean_2]), itertools.cycle([var_2]),
@@ -219,11 +235,13 @@ def cokrige_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_poi
 
     est_cokrige = np.zeros(shape=len(simulate_coords)) 
     var_cokrige = np.zeros(shape=len(simulate_coords))
+
+    # use python multiprocessing library to execute parallel_cokrige function in parallel
     out = pool.starmap(parallel_cokrige, args, chunksize=200)
 
+    # aggregate output into a dictionary to look up data by index
     for (idx, est_cokrige_out, var_cokrige_out) in out:
         
-        # aggregate output into a dictionary to look up data by index
         est_cokrige[idx] = est_cokrige_out
         var_cokrige[idx] = var_cokrige_out
 
@@ -233,6 +251,7 @@ def cokrige_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_poi
     full[len(df1):, 2] = est_cokrige
     full[len(df1):, 3] = var_cokrige
     
+    # reorder output to match that of the serialized implimentation
     full = full[np.lexsort((full[:,0], -full[:,1]))]
 
     return full[:,2], full[:,3]
@@ -253,7 +272,7 @@ def cosim_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_point
     # create starting index for data from full to use for KNN
     begin = len(observed_coords)
 
-    # create iterable parameter list
+    # create iterable parameter list for parameters to be used for function executed in parallel
     i = [i for i in range(len(simulate_coords))]
     args = zip(i, itertools.cycle([full]), itertools.cycle([df2[[xx2, yy2]].values]), itertools.cycle([vario]), itertools.cycle([radius]),
                itertools.cycle([num_points]), itertools.cycle([begin]), itertools.cycle([corrcoef]))
@@ -261,11 +280,13 @@ def cosim_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_point
     pool = mp.Pool(processes)
 
     kr_dictionary = {}
+
+    # use python multiprocessing library to execute parallel_cosim function in parallel
     out = pool.starmap(parallel_cosim, args, chunksize=200)
 
+    # aggregate output into a dictionary to look up data by index
     for (idx, weights, covariance_array, indicies, idx_df2) in out:
         
-        # aggregate output into a dictionary to look up data by index
         kr_dictionary[idx] = (weights, covariance_array, indicies, idx_df2)
 
     mean_1 = np.average(df1[zz1]) 
@@ -273,8 +294,10 @@ def cosim_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_point
     mean_2 = np.average(df2[zz2]) 
     var_2 = np.var(df2[zz2])
 
+    # use kriging weights to stochastically estimate the bed elevation
     sgs = pred_Z_cosim(kr_dictionary, full, df1[zz1], df2[zz2], mean_1, var_1, mean_2, var_2)
     
+    # reorder output to match that of the serialized implimentation
     sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
     return sgs[:,2]
@@ -286,25 +309,32 @@ def cosim_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_point
 
 def parallel_krige(i, simulate_coords, df, mean, vario, radius, num_points, krig):
     
+    # get location of current grid cell to simulate 
     loc = simulate_coords[i]
+
     var = vario[4]
 
+    # Perform nearest neighbor octant search
     near = NNS_ele(df, radius, num_points, loc)
     xy_val = near[:,0:2]
     norm_data_val = near[:,2]
 
+    # used for simple kriging
     if krig == 's':
         k_weights, covariance_array = skriging(xy_val, loc, vario)
 
+        # calculate elevation estimate and variance
         est_sk = mean + (np.sum(k_weights*(norm_data_val - mean))) 
         var_sk = var - np.sum(k_weights*covariance_array)
 
+    # used for ordinary kriging
     elif krig == 'o':
         k_weights, covariance_array = okriging(xy_val, loc, vario)
 
         mean = np.mean(norm_data_val)
         num_pts = len(near)
 
+        # calculate elevation estimate and variance
         est_sk = mean + (np.sum(k_weights[:num_pts]*(norm_data_val - mean))) 
         var_sk = var - np.sum(k_weights[:num_pts]*covariance_array[:num_pts])
 
@@ -319,13 +349,19 @@ def parallel_krige_sgs(i, full, vario, radius, num_points, begin, krig):
     # offset in all_xyk of location to simulate
     curr_offset = begin + i
     
+    # get location of current grid cell to simulate
     loc = full[curr_offset]
 
+    # store location of conditioning data and prior grid cells in the random path
     search_candidates = full[:curr_offset]
 
+    # perform nearest neighbor octant search
     near, indicies = NNS(search_candidates, radius, num_points, loc)
+
+    # used for simple kriging
     if krig == 's':
         k_weights, covariance_array = skriging(near, loc, vario)
+    # used for ordinary kriging
     elif krig == 'o':
         k_weights, covariance_array = okriging(near, loc, vario)
 
@@ -337,12 +373,16 @@ def parallel_cluster_sgs(i, full, gamma, radius, num_points, begin):
     # offset in all_xyk of location to simulate
     curr_offset = begin + i
     
+    # get location of current grid cell to simulate
     loc = full[curr_offset, 0:2]
 
+    # store location of conditioning data and prior grid cells in the random path
     search_candidates = full[:curr_offset]
 
+    # perform nearest neighbor octant search w/ randomly selecting variogram from a NN
     near, cluster_num, indicies = NNS_cluster(search_candidates, radius, num_points, loc)
     vario = gamma.Variogram[int(cluster_num)]
+
     k_weights, covariance_array = skriging(near, loc, vario)
 
     return i, k_weights, covariance_array, indicies, cluster_num
@@ -350,10 +390,13 @@ def parallel_cluster_sgs(i, full, gamma, radius, num_points, begin):
 
 def parallel_cokrige(i, simulate_coords, df1, mean1, var1, df2, mean2, var2, vario, radius, num_points, corrcoef):
     
+    # get location of current grid cell to simulate
     loc = simulate_coords[i]
 
+    # perform nearest neighbor octant search on both datasets 
     near1 = NNS_ele(df1, radius, num_points, loc)
     near2, _ = NNS_secondary(df2, loc)
+
     xy_val = np.append(near1[:,0:2], [near2[0:2]], axis = 0)
     norm_data_val = np.append(near1[:,2], [near2[2]])
 
@@ -361,6 +404,7 @@ def parallel_cokrige(i, simulate_coords, df1, mean1, var1, df2, mean2, var2, var
 
     num_pts = len(near1)
 
+    # calculate elevation estimate and variance
     part1 = mean1 + (np.sum(k_weights[:num_pts]*(norm_data_val[:num_pts] - mean1))/np.sqrt(var1))
     part2 = (np.sum(k_weights[num_pts]*(norm_data_val[num_pts] - mean2)))/np.sqrt(var2)
 
@@ -369,14 +413,18 @@ def parallel_cokrige(i, simulate_coords, df1, mean1, var1, df2, mean2, var2, var
 
     return i, est_cokrig, var_cokrig
 
+
 def parallel_cosim(i, full, df2, vario, radius, num_points, begin, corrcoef):
 
     curr_offset = begin + i
     
+    # get location of current grid cell to simulate
     loc = full[curr_offset]
 
+    # store location of conditioning data and prior grid cells in the random path
     search_candidates = full[:curr_offset]
 
+    # perform nearest neighbor octant search on both datasets 
     near1, indicies = NNS(search_candidates, radius, num_points, loc)
     near2, idx = NNS_secondary(df2, loc)
 
@@ -487,40 +535,47 @@ def cokriging(near, loc, vario, corrcoef):
 #####################################
 # Nearest neighbors search functions
 
+# Only used for deterministic algorithms where search is only performed on original conditioning data
 def NNS_ele(search_candidates, radius, num_points, loc):
 
+    # center search candidates wrt current grid cell being simulated
     centered = search_candidates[:,:2] - loc
 
+    # find angle between current grid cell and search candidates
     angles = np.arctan2(centered[:, 0], centered[:, 1])
 
+    # find distances between current grid cell to search candidates
     dist = np.linalg.norm(centered, axis = 1)
 
     radius_filter = dist < radius
 
+    # filter search candidates by excluding those outside of specified radius
     search_candidates = search_candidates[radius_filter,:]
     angles = angles[radius_filter]
     dist = dist[radius_filter]
 
     sort = np.argsort(dist)
 
+    # sort search candidates from closest to furtherest to current grid cell
     search_candidates = search_candidates[sort]
     angles = angles[sort]
     dist = dist[sort]
 
     bins = [-math.pi, -3*math.pi/4, -math.pi/2, -math.pi/4, 0, 
-            math.pi/4, math.pi/2, 3*math.pi/4, math.pi + 1] 
+            math.pi/4, math.pi/2, 3*math.pi/4, math.pi] 
     
     oct = np.zeros(len(angles))
     
-    # get 
+    # determine which octanct each NN candidate is in
     for i, angle in enumerate(angles):
         for j in range (8):
-            if angle >= bins[j] and angle < bins[j+1]:
+            if angle > bins[j] and angle <= bins[j+1]:
                 oct[i] = j
 
     oct_count = num_points // 8
     nearest = np.ones(shape=(num_points, 3)) * np.nan
 
+    # find NN from each octant
     for i in range(8):
     
         octant = search_candidates[oct == i][:oct_count]
@@ -534,18 +589,23 @@ def NNS_ele(search_candidates, radius, num_points, loc):
     return near
 
 
+# Used for stochastic algorithms where search candidates include original conditioning data and previously simulated points
 def NNS(search_candidates, radius, num_points, loc):
 
+    # center search candidates wrt current grid cell being simulated
     centered = search_candidates - loc
 
     idx = np.arange(len(search_candidates))
 
+    # find angle between current grid cell and search candidates
     angles = np.arctan2(centered[:, 0], centered[:, 1])
 
+    # find distances between current grid cell to search candidates
     dist = np.linalg.norm(centered, axis = 1)
 
     radius_filter = dist < radius
 
+    # filter search candidates by excluding those outside of specified radius
     centered = centered[radius_filter,:]
     angles = angles[radius_filter]
     dist = dist[radius_filter]
@@ -553,26 +613,28 @@ def NNS(search_candidates, radius, num_points, loc):
 
     sort = np.argsort(dist)
 
+    # sort search candidates from closest to furtherest to current grid cell
     centered = centered[sort]
     angles = angles[sort]
     dist = dist[sort]
     idx = idx[sort]
 
     bins = [-math.pi, -3*math.pi/4, -math.pi/2, -math.pi/4, 0, 
-            math.pi/4, math.pi/2, 3*math.pi/4, math.pi + 1] 
+            math.pi/4, math.pi/2, 3*math.pi/4, math.pi] 
     
     oct = np.zeros(len(angles))
     
-    # get 
+    # determine which octanct each NN candidate is in
     for i, angle in enumerate(angles):
         for j in range (8):
-            if angle >= bins[j] and angle < bins[j+1]:
+            if angle > bins[j] and angle <= bins[j+1]:
                 oct[i] = j
 
     oct_count = num_points // 8
     nearest = np.ones(shape=(num_points, 2)) * np.nan
     indicies = np.ones(num_points) * np.nan
 
+    # find NN from each octant
     for i in range(8):
     
         octant = centered[oct == i][:oct_count]
@@ -619,14 +681,14 @@ def NNS_cluster(search_candidates, radius, num_points, loc):
     idx = idx[sort]
 
     bins = [-math.pi, -3*math.pi/4, -math.pi/2, -math.pi/4, 0, 
-            math.pi/4, math.pi/2, 3*math.pi/4, math.pi + 1] 
+            math.pi/4, math.pi/2, 3*math.pi/4, math.pi] 
     
     oct = np.zeros(len(angles))
     
     # get 
     for i, angle in enumerate(angles):
         for j in range (8):
-            if angle >= bins[j] and angle < bins[j+1]:
+            if angle > bins[j] and angle <= bins[j+1]:
                 oct[i] = j
 
     oct_count = num_points // 8
@@ -667,12 +729,13 @@ def NNS_secondary(search_candidates, loc):
 
 def pred_Z(kr_dictionary, full, df, vario, krig):
                  
-    z_mean = np.average(df.values) # CHANGE TO Z 
+    z_mean = np.average(df.values)
     z_lookup = np.zeros(len(full))
     z_lookup[:len(df)] = df.values
     
     for i in range(len(full) - len(df)):
         
+        # get krigining weights and indicies to coorespond with NN location
         weights, covariance_array, indicies = kr_dictionary[i]
         near_ele = np.array([z_lookup[int(idx)] for idx in indicies])
                                 
@@ -692,15 +755,17 @@ def pred_Z(kr_dictionary, full, df, vario, krig):
 
 def pred_Z_cluster(kr_dictionary, full, df, gamma):
                  
-    z_mean = np.average(df['Nbed'].values) # CHANGE TO Z 
+    z_mean = np.average(df.values)
     z_lookup = np.zeros(len(full))
-    z_lookup[:len(df)] = df['Nbed'].values
+    z_lookup[:len(df)] = df.values
     
     for i in range(len(full) - len(df)):
         
+        # get krigining weights and indicies to coorespond with NN location
         weights, covariance_array, indicies, cluster_num = kr_dictionary[i]
         near_ele = np.array([z_lookup[int(idx)] for idx in indicies])
         
+        # get variogram from randomly selected NN
         vario = gamma.Variogram[int(cluster_num)]
         
         # calculate kriging mean and variance
@@ -721,6 +786,7 @@ def pred_Z_cosim(kr_dictionary, full, df1_ele, df2_ele, mean_1, var_1, mean_2, v
 
     for i in range(len(full) - len(df1_ele)):
         
+        # get krigining weights and indicies to coorespond with NN locations
         weights, covariance_array, indicies, idx_df2  = kr_dictionary[i]
         near_ele = np.array([z_lookup[int(idx)] for idx in indicies])
         near_ele = np.append(near_ele, [df2_ele[idx_df2]])
