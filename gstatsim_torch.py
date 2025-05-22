@@ -16,27 +16,6 @@ from tqdm import tqdm
 import random
 from sklearn.metrics import pairwise_distances
 import torch
-import cProfile, pstats, io
-
-
-def profile(fnc):
-    
-    """A decorator that uses cProfile to profile a function"""
-    
-    def inner(*args, **kwargs):
-        
-        pr = cProfile.Profile()
-        pr.enable()
-        retval = fnc(*args, **kwargs)
-        pr.disable()
-        s = io.StringIO()
-        sortby = 'cumulative'
-        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-        ps.print_stats()
-        print(s.getvalue())
-        return retval
-
-    return inner
 
 ############################
 
@@ -146,6 +125,7 @@ class Gridding:
                 number of columns in grid_matrix
         """ 
         df = df.rename(columns = {xx: "X", yy: "Y", zz: "Z"})
+        df = df[['X','Y','Z']] 
         data = torch.tensor(df.values)
 
         xmin = torch.min(data[:,0])
@@ -238,71 +218,6 @@ def rbf_trend(grid_matrix, smooth_factor, res):
 ####################################
 
 class NearestNeighbor:
-
-    def center(arrayx, arrayy, centerx, centery):
-        """
-        Shift data points so that grid cell of interest is at the origin
-        
-        Parameters
-        ----------
-            arrayx : numpy.ndarray
-                x coordinates of data
-            arrayy : numpy.ndarray
-                y coordinates of data
-            centerx : float
-                x coordinate of grid cell of interest
-            centery : float
-                y coordinate of grid cell of interest
-        
-        Returns
-        -------
-            centered_array : torch.tensor
-                array of coordinates that are shifted with respect to grid cell of interest
-        """ 
-        
-        centerx = arrayx - centerx
-        centery = arrayy - centery
-        centered_array = torch.stack((centerx, centery), dim=1)
-        
-        return centered_array
-
-    def distance_calculator(centered_array):
-        """
-        Compute distances between coordinates and the origin
-        
-        Parameters
-        ----------
-            centered_array : torch.tensor
-                array of coordinates
-        
-        Returns
-        -------
-            dist : torch.tensor
-                array of distances between coordinates and origin
-        """ 
-        
-        dist = torch.linalg.norm(centered_array, axis=1)
-        
-        return dist
-
-    def angle_calculator(centered_array):
-        """
-        Compute angles between coordinates and the origin
-        
-        Parameters
-        ----------
-            centered_array : torch.tensor
-                array of coordinates
-        
-        Returns
-        -------
-            angles : torch.tensor
-                array of angles between coordinates and origin
-        """ 
-        
-        angles = torch.atan2(centered_array[:, 0], centered_array[:, 1])
-        
-        return angles
       
     def nearest_neighbor_search(radius, num_points, loc, data2, device):
         """
@@ -352,7 +267,7 @@ class NearestNeighbor:
         # Use bucketize to find bin index for each angle
         bins = torch.tensor([-math.pi, -3*math.pi/4, -math.pi/2, -math.pi/4, 0,
                              math.pi/4, math.pi/2, 3*math.pi/4, math.pi], device=device)
-        bin_indices = torch.bucketize(stack[:, 4].contiguous(), bins, right=True)  # The angles are at index 4
+        bin_indices = torch.bucketize(stack[:, 4].contiguous(), bins, right=False)  # The angles are at index 4
 
         # Allocate tensor for the result
         smallest = torch.full((num_points, 3), float('nan'), device=device)
@@ -372,7 +287,7 @@ class NearestNeighbor:
         return near
 
     
-    def nearest_neighbor_search_cluster(radius, num_points, loc, data2):
+    def nearest_neighbor_search_cluster(radius, num_points, loc, data2, device):
         """
         Nearest neighbor octant search when doing sgs with clusters
         
@@ -397,27 +312,50 @@ class NearestNeighbor:
         
         locx = loc[0]
         locy = loc[1]
-        data = data2.copy()
-        centered_array = NearestNeighbor.center(data['X'].values, data['Y'].values, 
-                                locx, locy)
-        data["dist"] = NearestNeighbor.distance_calculator(centered_array).cpu().numpy()
-        data["angles"] = NearestNeighbor.angle_calculator(centered_array).cpu().numpy()
-        data = data[data.dist < radius] 
-        data = data.sort_values('dist', ascending = True)
-        data = data.reset_index() 
-        cluster_number = data.K[0]
-        # look into numpy
-        bins = [-math.pi, -3*math.pi/4, -math.pi/2, -math.pi/4, 0, 
-                math.pi/4, math.pi/2, 3*math.pi/4, math.pi]
-        data["Oct"] = pd.cut(data.angles, bins = bins, labels = list(range(8))) 
-        oct_count = num_points // 8
-        smallest = np.ones(shape=(num_points, 3)) * np.nan
 
-        for i in range(8):
-            octant = data[data.Oct == i].iloc[:oct_count][['X','Y','Z']].values
-            for j, row in enumerate(octant):
-                smallest[i*oct_count+j,:] = row 
-        near = smallest[~np.isnan(smallest)].reshape(-1,3) 
+        x_tensor = data2[:, 0]
+        y_tensor = data2[:, 1]
+        z_tensor = data2[:, 2]
+        k_tensor = data2[:, 3]
+
+        centered_x = x_tensor - locx
+        centered_y = y_tensor - locy
+        
+        distances = torch.sqrt(centered_x**2 + centered_y**2)
+        angles = torch.atan2(centered_y, centered_x)
+        
+        # Stack the tensors into a single tensor
+        stack = torch.stack((x_tensor, y_tensor, z_tensor, k_tensor, distances, angles), dim=1)
+
+        # Filter out points outside the radius
+        mask = stack[:, 4] < radius  # The distances are at index 3
+        stack = stack[mask]
+
+        # Sort the stack based on the distances
+        sorted_indices = torch.argsort(stack[:, 4])  # The distances are at index 3
+        stack = stack[sorted_indices]
+        
+        cluster_number = stack[0, 3]
+
+        # Use bucketize to find bin index for each angle
+        bins = torch.tensor([-math.pi, -3*math.pi/4, -math.pi/2, -math.pi/4, 0,
+                             math.pi/4, math.pi/2, 3*math.pi/4, math.pi], device=device)
+        bin_indices = torch.bucketize(stack[:, 5].contiguous(), bins, right=False)  # The angles are at index 4
+
+        # Allocate tensor for the result
+        smallest = torch.full((num_points, 3), float('nan'), device=device)
+        oct_count = num_points // 8
+
+        # Collect points for each bin
+        for i in range(1, bins.shape[0]):
+            current_bin_mask = bin_indices == i
+            current_bin_points = stack[current_bin_mask][:, :3]  # Get X, Y, Z
+            bin_points_count = min(oct_count, current_bin_points.shape[0])
+            if bin_points_count > 0:
+                smallest[(i-1) * oct_count : (i-1) * oct_count + bin_points_count, :] = current_bin_points[:bin_points_count, :]
+
+        # Remove NaN values to get the final result
+        near = smallest[~torch.isnan(smallest[:, 0])].reshape(-1, 3)
         
         return near, cluster_number
 
@@ -440,13 +378,24 @@ class NearestNeighbor:
         
         locx = loc[0]
         locy = loc[1]
-        data = data2.copy()
-        centered_array = NearestNeighbor.center(data['X'].values, data['Y'].values, 
-                                locx, locy)
-        data["dist"] = NearestNeighbor.distance_calculator(centered_array)
-        data = data.sort_values('dist', ascending = True) 
-        data = data.reset_index() 
-        nearest_second = data.iloc[0][['X','Y','Z']].values 
+        
+        x_tensor = data2[:, 0]
+        y_tensor = data2[:, 1]
+        z_tensor = data2[:, 2]
+
+        centered_x = x_tensor - locx
+        centered_y = y_tensor - locy
+        
+        distances = torch.sqrt(centered_x**2 + centered_y**2)
+        
+        # Stack the tensors into a single tensor
+        stack = torch.stack((x_tensor, y_tensor, z_tensor, distances), dim=1)
+
+
+        # Sort the stack based on the distances
+        sorted_indices = torch.argsort(stack[:, 3])  # The distances are at index 3
+        stack = stack[sorted_indices]
+        nearest_second = stack[0,:3]
         
         return nearest_second
 
@@ -979,6 +928,9 @@ class Interpolation:
         mean_1 = data[:,2].mean() 
         var_1 = vario[4]
         sgs = torch.zeros(len(prediction_grid), device=device) 
+        
+        # Convert prediction_grid to tensor
+        prediction_grid = prediction_grid.to(device)
 
         # build the iterator
         if not quiet:
@@ -1023,9 +975,9 @@ class Interpolation:
             new = torch.cat((torch.squeeze(coords), sgs[z].reshape(1)))
             data = torch.cat((data,new.unsqueeze(0)), dim=0) 
                              
-        return data
+        return sgs.cpu().numpy()
    
-    def okrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, quiet=False):
+    def okrige_sgs(prediction_grid, data, num_points, vario, radius, quiet=False):
         """
         Sequential Gaussian simulation using ordinary kriging 
         
@@ -1059,17 +1011,24 @@ class Interpolation:
                 simulated value for each coordinate in prediction_grid
         """
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         # unpack variogram parameters
         azimuth = vario[0]
         major_range = vario[2]
         minor_range = vario[3]
-        rotation_matrix = make_rotation_matrix(azimuth, major_range, minor_range) 
+        rotation_matrix = make_rotation_matrix(azimuth, major_range, minor_range, device)
+        
+        # X, Y, Z tensor
+        data = data.to(device)
 
-        df = df.rename(columns = {xx: "X", yy: "Y", zz: "Z"}) 
-        xyindex = np.arange(len(prediction_grid)) 
-        random.shuffle(xyindex)
+        xyindex = torch.arange(len(prediction_grid)) 
+        xyindex = xyindex[torch.randperm(len(prediction_grid))]
         var_1 = vario[4]
-        sgs = np.zeros(shape=len(prediction_grid))  
+        sgs = torch.zeros(len(prediction_grid), device=device)
+        
+        # Convert prediction_grid to tensor
+        prediction_grid = prediction_grid.to(device)
 
         # build the iterator
         if not quiet:
@@ -1079,50 +1038,49 @@ class Interpolation:
 
         for idx, predxy in _iterator:
             z = xyindex[idx] 
-            test_idx = np.sum(prediction_grid[z]==df[['X', 'Y']].values,axis = 1)
-            if np.sum(test_idx==2)==0:
+            test_idx = torch.all(torch.eq(data[:, :2], prediction_grid[z]), dim=1)
+            if not test_idx.any():
                 
                 # gather nearest neighbor points
-                nearest = NearestNeighbor.nearest_neighbor_search(radius, num_points, 
-                                                  prediction_grid[z], df[['X','Y','Z']]) 
-                norm_data_val = nearest[:,-1]   
+                nearest = NearestNeighbor.nearest_neighbor_search(radius, num_points, prediction_grid[z],
+                                                                    data, device) 
+                norm_data_val = nearest[:,-1]
+                
+                local_mean = torch.mean(norm_data_val)
+                
                 xy_val = nearest[:,:-1]   
-                local_mean = np.mean(norm_data_val) 
                 new_num_pts = len(nearest) 
 
                 # covariance between data
-                covariance_matrix = np.zeros(shape=((new_num_pts+1, new_num_pts+1))) 
+                covariance_matrix = torch.ones((new_num_pts+1, new_num_pts+1), device=device, dtype=torch.float64)
                 covariance_matrix[0:new_num_pts,0:new_num_pts] = Covariance.make_covariance_matrix(xy_val, 
                                                                                         vario, rotation_matrix)
-                covariance_matrix[new_num_pts,0:new_num_pts] = 1
-                covariance_matrix[0:new_num_pts,new_num_pts] = 1
 
                 # Set up Right Hand Side (covariance between data and unknown)
-                covariance_array = np.zeros(shape=(new_num_pts+1))
-                k_weights = np.zeros(shape=(new_num_pts+1))
-                covariance_array[0:new_num_pts] = Covariance.make_covariance_array(xy_val, 
-                                                                        np.tile(prediction_grid[z], new_num_pts), 
-                                                                        vario, rotation_matrix)
-                covariance_array[new_num_pts] = 1 
-                covariance_matrix.reshape(((new_num_pts+1)), ((new_num_pts+1)))
+                covariance_array = torch.ones((new_num_pts+1), device=device, dtype=torch.float64)
+                covariance_array[0:new_num_pts] = Covariance.make_covariance_array(xy_val, prediction_grid[z].unsqueeze(0).repeat(new_num_pts, 1), 
+                    vario, 
+                    rotation_matrix)
 
-                k_weights, res, rank, s = np.linalg.lstsq(covariance_matrix, 
-                                                          covariance_array, rcond = None)           
-                est = local_mean + np.sum(k_weights[0:new_num_pts]*(norm_data_val - local_mean)) 
-                var = var_1 - np.sum(k_weights[0:new_num_pts]*covariance_array[0:new_num_pts]) 
-                var = np.absolute(var)
+                k_weights = torch.linalg.lstsq(covariance_matrix, 
+                                               covariance_array.unsqueeze(-1)).solution.squeeze(-1)           
+                est = local_mean + torch.dot(k_weights[0:new_num_pts], (norm_data_val - local_mean).to(dtype=torch.float64)) 
+                var = var_1 - torch.dot(k_weights[0:new_num_pts],covariance_array[0:new_num_pts]) 
+                var = torch.absolute(var)
 
-                sgs[z] = np.random.normal(est,math.sqrt(var),1) 
+                sgs[z] = torch.normal(est,torch.sqrt(var)) 
             else:
-                sgs[z] = df['Z'].values[np.where(test_idx==2)[0][0]] 
+                sgs[z] = data[test_idx, 2].item()
 
-            coords = prediction_grid[z:z+1,:]
-            df = pd.concat([df,pd.DataFrame({'X': [coords[0,0]], 'Y': [coords[0,1]], 'Z': [sgs[z]]})], sort=False) 
+            coords = prediction_grid[z,:]
+            
+            new = torch.cat((torch.squeeze(coords), sgs[z].reshape(1)))
+            data = torch.cat((data,new.unsqueeze(0)), dim=0) 
 
-        return sgs
+        return sgs.cpu().numpy()
 
 
-    def cluster_sgs(prediction_grid, df, xx, yy, zz, kk, num_points, df_gamma, radius, quiet=False):
+    def cluster_sgs(prediction_grid, data, num_points, df_gamma, radius, quiet=False):
         """
         Sequential Gaussian simulation where variogram parameters are different for each k cluster. Uses simple kriging 
         
@@ -1157,12 +1115,19 @@ class Interpolation:
             sgs : numpy.ndarray
                 simulated value for each coordinate in prediction_grid
         """
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # X, Y, Z tensor
+        data = data.to(device)
 
-        df = df.rename(columns = {xx: "X", yy: "Y", zz: "Z", kk: "K"})  
-        xyindex = np.arange(len(prediction_grid)) 
-        random.shuffle(xyindex)
-        mean_1 = np.average(df["Z"].values) 
-        sgs = np.zeros(shape=len(prediction_grid)) 
+        xyindex = torch.arange(len(prediction_grid)) 
+        xyindex = xyindex[torch.randperm(len(prediction_grid))]
+        mean_1 = data[:,2].mean()
+        sgs = torch.zeros(len(prediction_grid), device=device) 
+        
+        # Convert prediction_grid to tensor
+        prediction_grid = prediction_grid.to(device)
 
         # build the iterator
         if not quiet:
@@ -1172,15 +1137,13 @@ class Interpolation:
 
         for idx, predxy in _iterator:
             z = xyindex[idx] 
-            test_idx = np.sum(prediction_grid[z]==df[['X', 'Y']].values,axis = 1)
-            if np.sum(test_idx==2)==0: 
+            test_idx = torch.all(torch.eq(data[:, :2], prediction_grid[z]), dim=1)
+            if not test_idx.any():
                 
                 # gather nearest neighbor points and K cluster value
-                nearest, cluster_number = NearestNeighbor.nearest_neighbor_search_cluster(radius, 
-                                                                                          num_points, 
-                                                                                          prediction_grid[z],
-                                                                                          df[['X','Y','Z','K']])  
-                vario = df_gamma.Variogram[cluster_number] 
+                nearest, cluster_number = NearestNeighbor.nearest_neighbor_search_cluster(radius, num_points, 
+                                                                                          prediction_grid[z], data, device)
+                vario = df_gamma.Variogram[cluster_number.item()] 
                 norm_data_val = nearest[:,-1]   
                 xy_val = nearest[:,:-1]   
 
@@ -1189,38 +1152,39 @@ class Interpolation:
                 major_range = vario[2]
                 minor_range = vario[3]
                 var_1 = vario[4]
-                rotation_matrix = make_rotation_matrix(azimuth, major_range, minor_range) 
+                rotation_matrix = make_rotation_matrix(azimuth, major_range, minor_range, device) 
                 new_num_pts = len(nearest)
 
                 # covariance between data
-                covariance_matrix = np.zeros(shape=((new_num_pts, new_num_pts))) 
-                covariance_matrix[0:new_num_pts,0:new_num_pts] = Covariance.make_covariance_matrix(xy_val, 
-                                                                                                   vario, 
-                                                                                                   rotation_matrix) 
-                
+                covariance_matrix = Covariance.make_covariance_matrix(xy_val, vario, rotation_matrix)
+
                 # covariance between data and unknown
-                covariance_array = np.zeros(shape=(new_num_pts)) 
-                k_weights = np.zeros(shape=(new_num_pts))
-                covariance_array = Covariance.make_covariance_array(xy_val, np.tile(prediction_grid[z], new_num_pts), 
-                                                                    vario, rotation_matrix)
-                covariance_matrix.reshape(((new_num_pts)), ((new_num_pts)))
-                k_weights, res, rank, s = np.linalg.lstsq(covariance_matrix, covariance_array, rcond = None) 
-                est = mean_1 + np.sum(k_weights*(norm_data_val - mean_1)) 
-                var = var_1 - np.sum(k_weights*covariance_array)
-                var = np.absolute(var) 
-
-                sgs[z] = np.random.normal(est,math.sqrt(var),1) 
+                covariance_array = Covariance.make_covariance_array(xy_val, 
+                    prediction_grid[z].unsqueeze(0).repeat(new_num_pts, 1), 
+                    vario, 
+                    rotation_matrix
+               )
+                 
+                k_weights = torch.linalg.lstsq(covariance_matrix, 
+                                               covariance_array.unsqueeze(-1)).solution.squeeze(-1)
+                
+                # get estimates
+                est =  mean_1 + torch.dot(k_weights, (norm_data_val - mean_1).to(dtype=torch.float64)) 
+                var = var_1 - torch.dot(k_weights, covariance_array)
+                var = torch.absolute(var) 
+                sgs[z] = torch.normal(est,torch.sqrt(var)) 
             else:
-                sgs[z] = df['Z'].values[np.where(test_idx==2)[0][0]]
-                cluster_number = df['K'].values[np.where(test_idx==2)[0][0]]
+                sgs[z] = data[test_idx, 2].item()
+                cluster_number = data[test_idx, 3].item()
 
-            coords = prediction_grid[z:z+1,:] 
-            df = pd.concat([df,pd.DataFrame({'X': [coords[0,0]], 'Y': [coords[0,1]], 
-                                             'Z': [sgs[z]], 'K': [cluster_number]})], sort=False)
+            coords = prediction_grid[z,:]
 
-        return sgs
+            new = torch.cat((torch.squeeze(coords), sgs[z].reshape(1), torch.tensor([cluster_number], device=device)))
+            data = torch.cat((data,new.unsqueeze(0)), dim=0) 
 
-    def cokrige_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_points, vario, radius, corrcoef, quiet=False):
+        return sgs.cpu().numpy()
+
+    def cokrige_mm1(prediction_grid, data1, xx1, yy1, zz1, data2, xx2, yy2, zz2, num_points, vario, radius, corrcoef, quiet=False):
         """
         Simple collocated cokriging under Markov model 1 assumptions
         
@@ -1266,23 +1230,29 @@ class Interpolation:
                 cokriging variances
         """
         
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         # unpack variogram parameters for rotation matrix
         azimuth = vario[0]
         major_range = vario[2]
         minor_range = vario[3]
-        rotation_matrix = make_rotation_matrix(azimuth, major_range, minor_range) 
+        rotation_matrix = make_rotation_matrix(azimuth, major_range, minor_range, device) 
+        
+        # X, Y, Z tensor
+        data1 = data1.to(device)
+        data2 = data2.to(device)
+        
+        # Convert prediction_grid to tensor
+        prediction_grid = prediction_grid.to(device)
 
-        df1 = df1.rename(columns = {xx1: "X", yy1: "Y", zz1: "Z"})
-        df2 = df2.rename(columns = {xx2: "X", yy2: "Y", zz2: "Z"})
+        mean_1 = data1[:,2].mean() 
+        var_1 = data1[:,2].var()  # replaced var_1 = vario[4]
+        vario[4] = data1[:,2].var()
+        mean_2 = data2[:,2].mean() 
+        var_2 = data2[:,2].var()
 
-        mean_1 = np.average(df1['Z']) 
-        var_1 = np.var(df1['Z']) # replaced var_1 = vario[4]
-        vario[4] = np.var(df1['Z']) 
-        mean_2 = np.average(df2['Z']) 
-        var_2 = np.var(df2['Z'])
-
-        est_cokrige = np.zeros(shape=len(prediction_grid)) 
-        var_cokrige = np.zeros(shape=len(prediction_grid))
+        est_cokrige = torch.zeros(len(prediction_grid), device=device)
+        var_cokrige = torch.zeros(len(prediction_grid), device=device)
 
         # build the iterator
         if not quiet:
@@ -1291,56 +1261,49 @@ class Interpolation:
             _iterator = enumerate(prediction_grid)
 
         for z, predxy in _iterator:
-            test_idx = np.sum(prediction_grid[z]==df1[['X', 'Y']].values,axis = 1)
-            if np.sum(test_idx==2)==0: #
+            test_idx = torch.all(torch.eq(data1[:, :2], prediction_grid[z]), dim=1)
+            if not test_idx.any():
                 
                 # get nearest neighbors
-                nearest = NearestNeighbor.nearest_neighbor_search(radius, num_points, 
-                                                                  prediction_grid[z], 
-                                                                  df1[['X','Y','Z']])           
+                nearest = NearestNeighbor.nearest_neighbor_search(radius, num_points, prediction_grid[z],
+                                                                    data1, device)           
                 nearest_second = NearestNeighbor.nearest_neighbor_secondary(prediction_grid[z], 
-                                                                            df2[['X','Y','Z']]) 
+                                                                            data2) 
                 norm_data_val = nearest[:,-1] 
-                norm_data_val = np.append(norm_data_val, [nearest_second[-1]]) 
+                norm_data_val = torch.cat((norm_data_val, nearest_second[-1].reshape(1))) 
                 xy_val = nearest[:, :-1] 
                 xy_second = nearest_second[:-1] 
-                xy_val = np.append(xy_val, [xy_second], axis = 0) 
+                xy_val = torch.cat((xy_val, xy_second.unsqueeze(0))) 
                 new_num_pts = len(nearest)
 
                 # covariance between data points
-                covariance_matrix = np.zeros(shape=((new_num_pts + 1, new_num_pts + 1)))
-                covariance_matrix[0:new_num_pts+1, 0:new_num_pts+1] = Covariance.make_covariance_matrix(xy_val, 
-                                                                                                        vario, rotation_matrix) 
+                covariance_matrix = Covariance.make_covariance_matrix(xy_val, vario, rotation_matrix) 
 
                 # covariance between data and unknown
-                covariance_array = np.zeros(shape=(new_num_pts + 1)) 
-                k_weights = np.zeros(shape=(new_num_pts + 1))
-                covariance_array[0:new_num_pts+1] = Covariance.make_covariance_array(xy_val, 
-                                                                                     np.tile(prediction_grid[z], 
-                                                                                             new_num_pts + 1), 
-                                                                                     vario, rotation_matrix)
+                covariance_array = Covariance.make_covariance_array(xy_val, prediction_grid[z].unsqueeze(0).repeat(new_num_pts + 1, 1), 
+                                                                    vario, rotation_matrix)
                 covariance_array[new_num_pts] = covariance_array[new_num_pts] * corrcoef 
 
                 # update covariance matrix with secondary info (gamma2 = rho12 * gamma1)
                 covariance_matrix[new_num_pts, 0 : new_num_pts+1] = covariance_matrix[new_num_pts, 0 : new_num_pts+1] * corrcoef
                 covariance_matrix[0 : new_num_pts+1, new_num_pts] = covariance_matrix[0 : new_num_pts+1, new_num_pts] * corrcoef
                 covariance_matrix[new_num_pts, new_num_pts] = 1
-                covariance_matrix.reshape(((new_num_pts + 1)), ((new_num_pts + 1)))
 
                 # solve kriging system
-                k_weights, res, rank, s = np.linalg.lstsq(covariance_matrix, covariance_array, rcond = None) 
-                part1 = mean_1 + np.sum(k_weights[0:new_num_pts]*(norm_data_val[0:new_num_pts] - mean_1)/np.sqrt(var_1))
-                part2 = k_weights[new_num_pts] * (nearest_second[-1] - mean_2)/np.sqrt(var_2)
+                k_weights = torch.linalg.lstsq(covariance_matrix, covariance_array.unsqueeze(-1)).solution.squeeze(-1)
+                part1 = mean_1 + torch.dot(k_weights[0:new_num_pts], (norm_data_val[0:new_num_pts] - mean_1).to(dtype=torch.float64))/torch.sqrt(var_1)
+                part2 = k_weights[new_num_pts] * (nearest_second[-1] - mean_2)/torch.sqrt(var_2)
                                
                 est_cokrige[z] = part1 + part2 
-                var_cokrige[z] = var_1 - np.sum(k_weights*covariance_array) 
+                var_cokrige[z] = var_1 - torch.dot(k_weights, covariance_array)
             else:
-                est_cokrige[z] = df1['Z'].values[np.where(test_idx==2)[0][0]]
+                est_cokrige[z] = data1[test_idx, 2].item()
                 var_cokrige[z] = 0
 
+        est_cokrige, var_cokrige = est_cokrige.cpu().numpy(), var_cokrige.cpu().numpy()
         return est_cokrige, var_cokrige
 
-    def cosim_mm1(prediction_grid, df1, xx1, yy1, zz1, df2, xx2, yy2, zz2, num_points, vario, radius, corrcoef, quiet=False):
+    def cosim_mm1(prediction_grid, data1, xx1, yy1, zz1, data2, xx2, yy2, zz2, num_points, vario, radius, corrcoef, quiet=False):
         """
         Cosimulation under Markov model 1 assumptions
         
@@ -1383,24 +1346,32 @@ class Interpolation:
             cosim : numpy.ndarray
                 cosimulation for each point in coordinate grid
         """
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
         # unpack variogram parameters
         azimuth = vario[0]
         major_range = vario[2]
         minor_range = vario[3]
-        rotation_matrix = make_rotation_matrix(azimuth, major_range, minor_range)
-        df1 = df1.rename(columns = {xx1: "X", yy1: "Y", zz1: "Z"}) 
-        df2 = df2.rename(columns = {xx2: "X", yy2: "Y", zz2: "Z"})
-        xyindex = np.arange(len(prediction_grid)) 
-        random.shuffle(xyindex)
+        rotation_matrix = make_rotation_matrix(azimuth, major_range, minor_range, device)
+        
+        # X, Y, Z tensor
+        data1 = data1.to(device)
+        data2 = data2.to(device)
+        
+        # Convert prediction_grid to tensor
+        prediction_grid = prediction_grid.to(device)
+        
+        xyindex = torch.arange(len(prediction_grid)) 
+        xyindex = xyindex[torch.randperm(len(prediction_grid))]
 
-        mean_1 = np.average(df1['Z']) 
-        var_1 = np.var(df1['Z']) # replaced var_1 = vario[4]
-        vario[4] = np.var(df1['Z']) 
-        mean_2 = np.average(df2['Z']) 
-        var_2 = np.var(df2['Z'])
+        mean_1 = data1[:,2].mean() 
+        var_1 = data1[:,2].var()  # replaced var_1 = vario[4]
+        vario[4] = data1[:,2].var()
+        mean_2 = data2[:,2].mean() 
+        var_2 = data2[:,2].var()
    
-        cosim = np.zeros(shape=len(prediction_grid))
+        cosim = torch.zeros(len(prediction_grid), device=device) 
 
         # build the iterator
         if not quiet:
@@ -1411,58 +1382,53 @@ class Interpolation:
         # for each coordinate in the prediction grid
         for idx, predxy in _iterator:
             z = xyindex[idx]
-            test_idx = np.sum(prediction_grid[z]==df1[['X', 'Y']].values,axis = 1)
-            if np.sum(test_idx==2)==0:
+            test_idx = torch.all(torch.eq(data1[:, :2], prediction_grid[z]), dim=1)
+            if not test_idx.any():
                 
                 # get nearest neighbors
-                nearest = NearestNeighbor.nearest_neighbor_search(radius, num_points, 
-                                                                  prediction_grid[z], 
-                                                                  df1[['X','Y','Z']]) 
+                nearest = NearestNeighbor.nearest_neighbor_search(radius, num_points, prediction_grid[z],
+                                                                    data1, device)           
                 nearest_second = NearestNeighbor.nearest_neighbor_secondary(prediction_grid[z], 
-                                                                            df2[['X','Y','Z']])
-                norm_data_val = nearest[:,-1]
-                norm_data_val = np.append(norm_data_val, [nearest_second[-1]]) 
+                                                                            data2) 
+                norm_data_val = nearest[:,-1] 
+                norm_data_val = torch.cat((norm_data_val, nearest_second[-1].reshape(1))) 
                 xy_val = nearest[:, :-1] 
-                xy_second = nearest_second[:-1]
-                xy_val = np.append(xy_val, [xy_second], axis = 0) 
+                xy_second = nearest_second[:-1] 
+                xy_val = torch.cat((xy_val, xy_second.unsqueeze(0))) 
                 new_num_pts = len(nearest)
 
-                # covariance between data poitns
-                covariance_matrix = np.zeros(shape=((new_num_pts + 1, new_num_pts + 1))) 
-                covariance_matrix[0:new_num_pts+1, 0:new_num_pts+1] = Covariance.make_covariance_matrix(xy_val, 
-                                                                                                        vario, rotation_matrix) 
+                # covariance between data points
+                covariance_matrix = Covariance.make_covariance_matrix(xy_val, vario, rotation_matrix) 
 
                 # covariance between data and unknown
-                covariance_array = np.zeros(shape=(new_num_pts + 1))
-                k_weights = np.zeros(shape=(new_num_pts + 1))
-                covariance_array[0:new_num_pts+1] = Covariance.make_covariance_array(xy_val, 
-                                                                                     np.tile(prediction_grid[z], 
-                                                                                             new_num_pts + 1), 
-                                                                                     vario, rotation_matrix)
+                covariance_array = Covariance.make_covariance_array(xy_val, prediction_grid[z].unsqueeze(0).repeat(new_num_pts + 1, 1), 
+                                                                    vario, rotation_matrix)
                 covariance_array[new_num_pts] = covariance_array[new_num_pts] * corrcoef 
 
                 # update covariance matrix with secondary info (gamma2 = rho12 * gamma1)
                 covariance_matrix[new_num_pts, 0 : new_num_pts+1] = covariance_matrix[new_num_pts, 0 : new_num_pts+1] * corrcoef
                 covariance_matrix[0 : new_num_pts+1, new_num_pts] = covariance_matrix[0 : new_num_pts+1, new_num_pts] * corrcoef
                 covariance_matrix[new_num_pts, new_num_pts] = 1
-                covariance_matrix.reshape(((new_num_pts + 1)), ((new_num_pts + 1)))
 
                 # solve kriging system
-                k_weights, res, rank, s = np.linalg.lstsq(covariance_matrix, covariance_array, rcond = None) 
-                part1 = mean_1 + np.sum(k_weights[0:new_num_pts]*(norm_data_val[0:new_num_pts] - mean_1)/np.sqrt(var_1))
-                part2 = k_weights[new_num_pts] * (nearest_second[-1] - mean_2)/np.sqrt(var_2)
+                k_weights = torch.linalg.lstsq(covariance_matrix, covariance_array.unsqueeze(-1)).solution.squeeze(-1)
+                part1 = mean_1 + torch.dot(k_weights[0:new_num_pts], (norm_data_val[0:new_num_pts] - mean_1).to(dtype=torch.float64))/torch.sqrt(var_1)
+                part2 = k_weights[new_num_pts] * (nearest_second[-1] - mean_2)/torch.sqrt(var_2)
+                
                 est_cokrige = part1 + part2 
-                var_cokrige = var_1 - np.sum(k_weights*covariance_array)
-                var_cokrige = np.absolute(var_cokrige) 
+                var_cokrige = var_1 - torch.dot(k_weights, covariance_array)
+                var_cokrige = torch.absolute(var_cokrige) 
 
-                cosim[z] = np.random.normal(est_cokrige,math.sqrt(var_cokrige),1) 
+                cosim[z] = torch.normal(est_cokrige,torch.sqrt(var_cokrige)) 
             else:
-                cosim[z] = df1['Z'].values[np.where(test_idx==2)[0][0]]
+                cosim[z] = data1[test_idx, 2].item()
 
-            coords = prediction_grid[z:z+1,:]
-            df1 = pd.concat([df1,pd.DataFrame({'X': [coords[0,0]], 'Y': [coords[0,1]], 'Z': [cosim[z]]})], sort=False) 
+            coords = prediction_grid[z,:]
 
-        return cosim
+            new = torch.cat((torch.squeeze(coords), cosim[z].reshape(1)))
+            data1 = torch.cat((data1,new.unsqueeze(0)), dim=0) 
+            
+        return cosim.cpu().numpy()
 
 __all__ = ['Gridding', 'NearestNeighbor', 'Covariance', 'Interpolation', 'rbf_trend', 
     'adaptive_partitioning', 'make_rotation_matrix']
