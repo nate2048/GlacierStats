@@ -1184,7 +1184,7 @@ class Interpolation:
 
         return sgs.cpu().numpy()
 
-    def cokrige_mm1(prediction_grid, data1, xx1, yy1, zz1, data2, xx2, yy2, zz2, num_points, vario, radius, corrcoef, quiet=False):
+    def cokrige_mm1(prediction_grid, data1, data2, num_points, vario, radius, corrcoef, quiet=False):
         """
         Simple collocated cokriging under Markov model 1 assumptions
         
@@ -1303,7 +1303,7 @@ class Interpolation:
         est_cokrige, var_cokrige = est_cokrige.cpu().numpy(), var_cokrige.cpu().numpy()
         return est_cokrige, var_cokrige
 
-    def cosim_mm1(prediction_grid, data1, xx1, yy1, zz1, data2, xx2, yy2, zz2, num_points, vario, radius, corrcoef, quiet=False):
+    def cosim_mm1(prediction_grid, data1, data2, num_points, vario, radius, corrcoef, quiet=False):
         """
         Cosimulation under Markov model 1 assumptions
         

@@ -13,7 +13,7 @@ import sys
 ##########################
 # Interpolation functions
 
-def skrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes):
+def skrige(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes):
 
     # seperate observed data with data to predict
     observed_coords = df[[xx, yy]].values.tolist()
@@ -52,7 +52,7 @@ def skrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, pr
     return full[:,2], full[:,3]
 
 
-def okrige_interp(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes):
+def okrige(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes):
 
     # seperate observed data with data to predict
     observed_coords = df[[xx, yy]].values.tolist()
@@ -445,10 +445,6 @@ def skriging(near, loc, vario):
     azimuth = vario[0]
     major_range = vario[2]
     minor_range = vario[3]
-    
-    if numpoints == 0:
-        print("ZEROOOO:")
-        sys.stdout.flush()
 
     rotation_matrix = gs.make_rotation_matrix(azimuth, major_range, minor_range)
 
@@ -474,10 +470,6 @@ def okriging(near, loc, vario):
     azimuth = vario[0]
     major_range = vario[2]
     minor_range = vario[3]
-    
-    if numpoints == 0:
-        print("ZEROOOO:")
-        sys.stdout.flush()
 
     rotation_matrix = gs.make_rotation_matrix(azimuth, major_range, minor_range)
 
@@ -654,27 +646,34 @@ def NNS_cluster(search_candidates, radius, num_points, loc):
 
     K_list = search_candidates[:,2]
 
+    # center search candidates wrt current grid cell being simulated
     centered = search_candidates[:,0:2] - loc
 
+    # create list to keep track of indicies of NN
     idx = np.arange(len(search_candidates))
 
+    # find angle between current grid cell and search candidates
     angles = np.arctan2(centered[:, 0], centered[:, 1])
-
+    
+    # find distances between current grid cell to search candidates
     dist = np.linalg.norm(centered, axis = 1)
 
     radius_filter = dist < radius
 
+    # filter search candidates by excluding those outside of specified radius
     centered = centered[radius_filter,:]
     angles = angles[radius_filter]
     dist = dist[radius_filter]
     K_list = K_list[radius_filter]
     idx = idx[radius_filter]
 
+    # choose random partition from filtered NN to use for the variogram parameters 
     rand_K = K_list[~np.isnan(K_list)]
     K = random.choice(rand_K)
 
     sort = np.argsort(dist)
 
+    # sort search candidates from closest to furtherest to current grid cell
     centered = centered[sort]
     angles = angles[sort]
     dist = dist[sort]
@@ -685,7 +684,7 @@ def NNS_cluster(search_candidates, radius, num_points, loc):
     
     oct = np.zeros(len(angles))
     
-    # get 
+    # determine which octanct each NN candidate is in
     for i, angle in enumerate(angles):
         for j in range (8):
             if angle > bins[j] and angle <= bins[j+1]:
@@ -695,6 +694,7 @@ def NNS_cluster(search_candidates, radius, num_points, loc):
     nearest = np.ones(shape=(num_points, 2)) * np.nan
     indicies = np.ones(num_points) * np.nan
 
+    # find NN from each octant
     for i in range(8):
     
         octant = centered[oct == i][:oct_count]
