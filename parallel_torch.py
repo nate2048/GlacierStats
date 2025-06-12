@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-import multiprocessing as mp
+import torch.multiprocessing as mp
 import numpy as np
 import pandas as pd
 import numpy.linalg as linalg
@@ -12,7 +12,7 @@ import torch
 import gstatsim_torch as gst
 import sys
 
-def skrige_sgs(prediction_grid, torch_data, num_points, vario, radius):
+def skrige_sgs_vectorized(prediction_grid, torch_data, num_points, vario, radius):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -64,7 +64,7 @@ def skrige_sgs(prediction_grid, torch_data, num_points, vario, radius):
 
     return sgs[:,2]
 
-def okrige_sgs(prediction_grid, torch_data, num_points, vario, radius):
+def skrige_sgs(prediction_grid, torch_data, num_points, vario, radius):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -80,15 +80,20 @@ def okrige_sgs(prediction_grid, torch_data, num_points, vario, radius):
     simulate_coords = simulate_coords[shuffle]
 
     full = torch.vstack((observed_coords, simulate_coords))
+    
+    azimuth = vario[0]
+    major_range = vario[2]
+    minor_range = vario[3]
+
+    rotation_matrix = gst.make_rotation_matrix(azimuth, major_range, minor_range, device)
 
     # create starting index for data from full to use for KNN
     begin = len(observed_coords)
 
-    kriging_p1 = {}
     kr_dictionary = {}
-    largest = 0
 
     for i in range(len(simulate_coords)):
+
         # offset in all_xyk of location to simulate
         curr_offset = begin + i
         
@@ -97,23 +102,180 @@ def okrige_sgs(prediction_grid, torch_data, num_points, vario, radius):
         search_candidates = full[:curr_offset]
 
         near, indicies = nearest_neighbor_search(radius, num_points, loc, search_candidates, device)
-        covariance_matrix, covariance_array = okriging_p1(near, loc, vario, device)
-        kriging_p1[i] = (covariance_matrix, covariance_array)
-        kr_dictionary[i] = [covariance_array, indicies]
+        
+        k_weights, covariance_array = skriging(near, loc, vario, rotation_matrix, device)
+        
+        kr_dictionary[i] = [covariance_array, indicies, k_weights]
 
-        if len(covariance_array) > largest:
-            largest = len(covariance_array)
-    
-    k_weights, size_list = kriging_p2(kriging_p1, largest, device)
 
-    for i in range(len(kr_dictionary)):
-        kr_dictionary[i].append(k_weights[i,:size_list[i]])
-    
     sgs = pred_Z(kr_dictionary, full, torch_data[:,2], vario, 's', device)
 
+    sgs = sgs.cpu()
     sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
     return sgs[:,2]
+
+def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, processes):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    observed_coords = torch_data[:,:2].tolist()
+    simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
+
+    observed_coords = torch.tensor(observed_coords, device = device)
+    simulate_coords = torch.tensor(simulate_coords, device = device)
+
+    # Shuffle data to predict to create a random path
+    index = torch.arange(len(simulate_coords)) 
+    shuffle = index[torch.randperm(len(simulate_coords))]
+    simulate_coords = simulate_coords[shuffle]
+
+    full = torch.vstack((observed_coords, simulate_coords))
+    
+    azimuth = vario[0]
+    major_range = vario[2]
+    minor_range = vario[3]
+
+    rotation_matrix = gst.make_rotation_matrix(azimuth, major_range, minor_range, device)
+
+    # create starting index for data from full to use for KNN
+    begin = len(observed_coords)
+    
+    i = [i for i in range(len(simulate_coords))]
+    args = zip(i, itertools.cycle([full]), itertools.cycle([vario]), itertools.cycle([radius]),
+               itertools.cycle([num_points]), itertools.cycle([begin]), 
+               itertools.cycle([rotation_matrix]), itertools.cycle([device]))
+    
+    mp.set_start_method('spawn', force=True)
+    pool = mp.Pool(processes)
+
+    kr_dictionary = {}
+    
+    # use python multiprocessing library to execute parallel_krige_sgs function in parallel
+    out = pool.starmap(run_parallel_sgs_krig, args, chunksize=200)
+    
+    # aggregate output into a dictionary to look up data by index
+    for (idx, weights, covariance_array, indicies) in out:
+        
+        kr_dictionary[idx] = [covariance_array, indicies, weights]
+
+        
+    sgs = pred_Z(kr_dictionary, full, torch_data[:,2], vario, 's', device)
+
+    sgs = sgs.cpu()
+    sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
+
+    return sgs[:,2]
+
+########################################################################################################################
+
+def run_parallel_sgs_krig(i, full, vario, radius, num_points, begin, rotation_matrix, device):
+    
+    curr_offset = begin + i
+
+    loc = full[curr_offset]
+
+    search_candidates = full[:curr_offset]
+
+    near, indicies = nearest_neighbor_search(radius, num_points, loc, search_candidates, device)
+
+    k_weights, covariance_array = skriging(near, loc, vario, rotation_matrix, device)
+    
+    
+    return i, k_weights, covariance_array, indicies
+
+########################################################################################################################
+
+def skriging(near, loc, vario, rotation_matrix, device):
+    
+    numpoints = len(near)
+    
+    # covariance between data
+    covariance_matrix = gst.Covariance.make_covariance_matrix(near, vario, rotation_matrix)
+    
+    # covariance between data and unknown
+    covariance_array = gst.Covariance.make_covariance_array(
+                    near, 
+                    loc.unsqueeze(0).repeat(numpoints, 1), 
+                    vario, 
+                    rotation_matrix
+                )
+    
+    k_weights = torch.linalg.lstsq(covariance_matrix, 
+                                               covariance_array.unsqueeze(-1)).solution.squeeze(-1)
+    
+    
+    return k_weights, covariance_array
+
+
+def skriging_p1(near, loc, vario, device):
+
+    numpoints = len(near)
+
+    azimuth = vario[0]
+    major_range = vario[2]
+    minor_range = vario[3]
+
+    rotation_matrix = gst.make_rotation_matrix(azimuth, major_range, minor_range, device)
+
+    # covariance between data
+    covariance_matrix = gst.Covariance.make_covariance_matrix(near, vario, rotation_matrix)
+
+    # covariance between data and unknown
+    covariance_array = gst.Covariance.make_covariance_array(
+                    near, 
+                    loc.unsqueeze(0).repeat(numpoints, 1), 
+                    vario, 
+                    rotation_matrix
+                )
+
+    return covariance_matrix, covariance_array
+
+def kriging_p2(kriging_p1, largest, device):
+
+    batch_matrix = torch.zeros(len(kriging_p1), largest, largest, device=device)
+    batch_array = torch.zeros(len(kriging_p1), largest, 1, device=device)
+    size_list = []
+
+    for i in range(len(kriging_p1)):
+
+        covariance_matrix, covariance_array = kriging_p1[i]
+        size = len(covariance_array)
+        size_list.append(size)
+        batch_matrix[i, :size, :size] = covariance_matrix
+        batch_array[i, :size] = covariance_array.unsqueeze(1)
+
+    k_weights = torch.linalg.lstsq(batch_matrix, batch_array).solution
+
+    return k_weights, size_list
+
+########################################################################################################################
+
+def pred_Z(kr_dictionary, full, df, vario, krig, device):
+                 
+    z_mean = torch.mean(df) 
+    z_lookup = torch.zeros(len(full), device = device)
+    z_lookup[:len(df)] = df
+    
+    for i in range(len(full) - len(df)):
+        
+        covariance_array, indicies, weights = kr_dictionary[i]
+        near_ele = torch.tensor([z_lookup[int(idx)] for idx in indicies], device=device)
+                                
+        if krig == 'o':
+            z_mean = torch.mean(near_ele)
+        
+        # calculate kriging mean and variance
+        est = z_mean + torch.dot(weights[:len(near_ele)].squeeze(), (near_ele - z_mean).to(dtype=torch.float64))
+        var = torch.abs(vario[4] - torch.dot(weights[:len(near_ele)].squeeze(), covariance_array[:len(near_ele)]))
+        
+        z_lookup[len(df) + i] = torch.normal(est,torch.sqrt(var))
+    
+    full = torch.column_stack((full, z_lookup))
+    
+    return full
+
+########################################################################################################################
 
 def nearest_neighbor_search(radius, num_points, loc, data2, device):
         
@@ -171,30 +333,65 @@ def nearest_neighbor_search(radius, num_points, loc, data2, device):
     index_list = index_list[~torch.isnan(index_list)]
 
     return near, index_list
+
+
+
+
+######################################################################################################
+
+
+
+
+def okrige_sgs(prediction_grid, torch_data, num_points, vario, radius):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    observed_coords = torch_data[:,:2].tolist()
+    simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
+
+    observed_coords = torch.tensor(observed_coords, device = device)
+    simulate_coords = torch.tensor(simulate_coords, device = device)
+
+    # Shuffle data to predict to create a random path
+    index = torch.arange(len(simulate_coords)) 
+    shuffle = index[torch.randperm(len(simulate_coords))]
+    simulate_coords = simulate_coords[shuffle]
+
+    full = torch.vstack((observed_coords, simulate_coords))
+
+    # create starting index for data from full to use for KNN
+    begin = len(observed_coords)
+
+    kriging_p1 = {}
+    kr_dictionary = {}
+    largest = 0
+
+    for i in range(len(simulate_coords)):
+        # offset in all_xyk of location to simulate
+        curr_offset = begin + i
         
+        loc = full[curr_offset]
 
-def skriging_p1(near, loc, vario, device):
+        search_candidates = full[:curr_offset]
 
-    numpoints = len(near)
+        near, indicies = nearest_neighbor_search(radius, num_points, loc, search_candidates, device)
+        covariance_matrix, covariance_array = okriging_p1(near, loc, vario, device)
+        kriging_p1[i] = (covariance_matrix, covariance_array)
+        kr_dictionary[i] = [covariance_array, indicies]
 
-    azimuth = vario[0]
-    major_range = vario[2]
-    minor_range = vario[3]
+        if len(covariance_array) > largest:
+            largest = len(covariance_array)
+    
+    k_weights, size_list = kriging_p2(kriging_p1, largest, device)
 
-    rotation_matrix = gst.make_rotation_matrix(azimuth, major_range, minor_range, device)
+    for i in range(len(kr_dictionary)):
+        kr_dictionary[i].append(k_weights[i,:size_list[i]])
+    
+    sgs = pred_Z(kr_dictionary, full, torch_data[:,2], vario, 's', device)
 
-    # covariance between data
-    covariance_matrix = gst.Covariance.make_covariance_matrix(near, vario, rotation_matrix)
+    sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
-    # covariance between data and unknown
-    covariance_array = gst.Covariance.make_covariance_array(
-                    near, 
-                    loc.unsqueeze(0).repeat(numpoints, 1), 
-                    vario, 
-                    rotation_matrix
-                )
-
-    return covariance_matrix, covariance_array
+    return sgs[:,2]
 
 def okriging_p1(near, loc, vario, device):
 
@@ -224,45 +421,3 @@ def okriging_p1(near, loc, vario, device):
 
     return covariance_matrix, covariance_array
 
-
-def kriging_p2(kriging_p1, largest, device):
-
-    batch_matrix = torch.zeros(len(kriging_p1), largest, largest, device=device)
-    batch_array = torch.zeros(len(kriging_p1), largest, 1, device=device)
-    size_list = []
-
-    for i in range(len(kriging_p1)):
-
-        covariance_matrix, covariance_array = kriging_p1[i]
-        size = len(covariance_array)
-        size_list.append(size)
-        batch_matrix[i, :size, :size] = covariance_matrix
-        batch_array[i, :size] = covariance_array.unsqueeze(1)
-
-    k_weights = torch.linalg.lstsq(batch_matrix, batch_array).solution
-
-    return k_weights, size_list
-
-def pred_Z(kr_dictionary, full, df, vario, krig, device):
-                 
-    z_mean = torch.mean(df) 
-    z_lookup = torch.zeros(len(full), device = device)
-    z_lookup[:len(df)] = df
-    
-    for i in range(len(full) - len(df)):
-        
-        covariance_array, indicies, weights = kr_dictionary[i]
-        near_ele = torch.tensor([z_lookup[int(idx)] for idx in indicies])
-                                
-        if krig == 'o':
-            z_mean = torch.mean(near_ele)
-        
-        # calculate kriging mean and variance
-        est = z_mean + torch.dot(weights[:len(near_ele)].squeeze(), (near_ele - z_mean))
-        var = torch.abs(vario[4] - torch.dot(weights[:len(near_ele)].squeeze(), covariance_array[:len(near_ele)].to(torch.float)))
-        
-        z_lookup[len(df) + i] = torch.normal(est,torch.sqrt(var))
-    
-    full = torch.column_stack((full, z_lookup))
-    
-    return full

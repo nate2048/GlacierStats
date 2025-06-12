@@ -90,14 +90,15 @@ def okrige(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes
 
     return full[:,2], full[:,3]
 
-def skrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes):
+def skrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes, seed=None):
+    
+    rng = get_random_generator(seed)
+    
+    grid_copy = np.copy(prediction_grid).tolist()
+    rng.shuffle(grid_copy)
 
-    # Seperate observed data with data to predict
     observed_coords = df[[xx, yy]].values.tolist()
-    simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
-
-    # Shuffle data to predict to create a random path
-    np.random.shuffle(simulate_coords)
+    simulate_coords = [coord for coord in grid_copy if coord not in observed_coords]
 
     full = np.vstack((np.array(observed_coords), np.array(simulate_coords)))
 
@@ -122,21 +123,22 @@ def skrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, proce
         kr_dictionary[idx] = (weights, covariance_array, indicies)
     
     # use kriging weights to stochastically estimate the bed elevation
-    sgs = pred_Z(kr_dictionary, full, df[zz], vario, 's')
+    sgs = pred_Z(kr_dictionary, full, df[zz], vario, rng, 's')
     
     # reorder output to match that of the serialized implimentation
     sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
     return sgs[:,2]
 
-def okrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes):
+def okrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, processes, seed=None):
+    
+    rng = get_random_generator(seed)
+    
+    grid_copy = np.copy(prediction_grid).tolist()
+    rng.shuffle(grid_copy)
 
-    # Seperate observed data with data to predict
     observed_coords = df[[xx, yy]].values.tolist()
-    simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
-
-    # Shuffle data to predict to create a random path
-    np.random.shuffle(simulate_coords)
+    simulate_coords = [coord for coord in grid_copy if coord not in observed_coords]
 
     full = np.vstack((np.array(observed_coords), np.array(simulate_coords)))
 
@@ -161,7 +163,7 @@ def okrige_sgs(prediction_grid, df, xx, yy, zz, num_points, vario, radius, proce
         kr_dictionary[idx] = (weights, covariance_array, indicies)
     
     # use kriging weights to stochastically estimate the bed elevation
-    sgs = pred_Z(kr_dictionary, full, df[zz], vario, 'o')
+    sgs = pred_Z(kr_dictionary, full, df[zz], vario, rng, 'o')
     
     # reorder output to match that of the serialized implimentation
     sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
@@ -727,11 +729,11 @@ def NNS_secondary(search_candidates, loc):
 ##################################
 # Elevation prediction functions
 
-def pred_Z(kr_dictionary, full, df, vario, krig):
+def pred_Z(kr_dictionary, full, df, vario, rng, krig):
                  
-    z_mean = np.average(df.values)
+    z_mean = np.average(df)
     z_lookup = np.zeros(len(full))
-    z_lookup[:len(df)] = df.values
+    z_lookup[:len(df)] = df
     
     for i in range(len(full) - len(df)):
         
@@ -746,7 +748,7 @@ def pred_Z(kr_dictionary, full, df, vario, krig):
         est = z_mean + np.sum(weights[:len(near_ele)] * (near_ele - z_mean))
         var = abs(vario[4] - np.sum(weights[:len(near_ele)] * covariance_array[:len(near_ele)]))
         
-        z_lookup[len(df) + i] = np.random.default_rng().normal(est, math.sqrt(var))
+        z_lookup[len(df) + i] = rng.normal(est, math.sqrt(var))
     
     full = np.column_stack((full, z_lookup))
     
@@ -805,3 +807,19 @@ def pred_Z_cosim(kr_dictionary, full, df1_ele, df2_ele, mean_1, var_1, mean_2, v
     full = np.column_stack((full, z_lookup))
 
     return full
+
+def get_random_generator(seed):
+    """
+    Conveniance function to get numpy random number generator for SGS. If seed is None, a random
+    seed is used. If seed is an integer, that integer is used to seed the RNG. If seed is
+    already an instance of a numpy RNG that is returned.
+    """
+    if seed is None:
+        rng = np.random.default_rng()
+    elif isinstance(seed, int):
+        rng = np.random.default_rng(seed=seed)
+    elif isinstance(seed, np.random._generator.Generator) or isinstance(seed, np.random.mtrand.RandomState) :
+        rng = seed
+    else:
+        raise ValueError('Seed should be an integer, a NumPy random Generator, or None')
+    return rng
