@@ -19,62 +19,63 @@ import gstatsim_torch as gst
 
 
 def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, num_gpus):
-    
-    with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
-        with record_function("parallel_torch"):
 
-            observed_coords = torch_data[:,:2].tolist()
-            simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
+    observed_coords = torch_data[:,:2].tolist()
+    simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
 
-            observed_coords = torch.tensor(observed_coords)
-            simulate_coords = torch.tensor(simulate_coords)
+    observed_coords = torch.tensor(observed_coords)
+    simulate_coords = torch.tensor(simulate_coords)
 
-            # Shuffle data to predict to create a random path
-            index = torch.arange(len(simulate_coords)) 
-            shuffle = index[torch.randperm(len(simulate_coords))]
-            simulate_coords = simulate_coords[shuffle]
+    # Shuffle data to predict to create a random path
+    index = torch.arange(len(simulate_coords)) 
+    shuffle = index[torch.randperm(len(simulate_coords))]
+    simulate_coords = simulate_coords[shuffle]
 
-            full = torch.vstack((observed_coords, simulate_coords))
+    full = torch.vstack((observed_coords, simulate_coords))
 
-            azimuth = vario[0]
-            major_range = vario[2]
-            minor_range = vario[3]
+    azimuth = vario[0]
+    major_range = vario[2]
+    minor_range = vario[3]
 
-            rotation_matrix = gst.make_rotation_matrix(azimuth, major_range, minor_range, "cpu")
+    rotation_matrix = gst.make_rotation_matrix(azimuth, major_range, minor_range, "cpu")
 
-            # create starting index for data from full to use for KNN
-            begin = len(observed_coords)
+    # create starting index for data from full to use for KNN
+    begin = len(observed_coords)
 
-            i = [i for i in range(len(simulate_coords))]
-            gpu_num = [i % num_gpus for i in range(len(simulate_coords))]
-            args = zip(i, gpu_num, itertools.cycle([full]), itertools.cycle([vario]), itertools.cycle([radius]),
-                       itertools.cycle([num_points]), itertools.cycle([begin]), itertools.cycle([rotation_matrix]))
+    num_cells = len(simulate_coords)
+    cells_per_process = num_cells//num_gpus
 
-            kr_dictionary = {}
+    i_list = [[i for i in range(j*cells_per_process, (j+1)*cells_per_process)] for j in range(num_gpus-1)]
+    i_list.append([i for i in range((num_gpus-1)*cells_per_process,num_cells)])
 
-            mp.set_start_method('spawn', force=True)
+    gpu_num = [i for i in range(num_gpus)]
 
-            with mp.Pool(processes=num_gpus) as pool:
-                # use python multiprocessing library to execute parallel_krige_sgs function in parallel
-                out = pool.starmap(run_parallel_sgs_krig, args, chunksize=200)
+    args = zip(i_list, gpu_num, itertools.cycle([full]), itertools.cycle([vario]), itertools.cycle([radius]),
+               itertools.cycle([num_points]), itertools.cycle([begin]), itertools.cycle([rotation_matrix]))
 
-            # aggregate output into a dictionary to look up data by index
-            for (idx, weights, covariance_array, indicies) in out:
+    kr_dictionary = {}
 
-                kr_dictionary[idx] = [covariance_array, indicies, weights]
+    mp.set_start_method('spawn', force=True)
+
+    with mp.Pool(processes=num_gpus) as pool:
+        # use python multiprocessing library to execute parallel_krige_sgs function in parallel
+        out = pool.starmap(run_parallel_sgs_krig, args)
+
+    # aggregate output into a dictionary to look up data by index
+    for kr_dict_subset in out:
+
+        kr_dictionary = kr_dictionary | kr_dict_subset
 
 
-            sgs = pred_Z(kr_dictionary, full, torch_data[:,2], vario, 's')
+    sgs = pred_Z(kr_dictionary, full, torch_data[:,2], vario, 's')
 
-            sgs = sgs.cpu()
-            sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
-            
-    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+    sgs = sgs.cpu()
+    sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
     return sgs[:,2]
 
 
-def run_parallel_sgs_krig(i, gpu_id, full, vario, radius, num_points, begin, rotation_matrix):
+def run_parallel_sgs_krig(i_list, gpu_id, full, vario, radius, num_points, begin, rotation_matrix):
     
     # Assign the GPU
     torch.cuda.set_device(gpu_id)
@@ -83,17 +84,23 @@ def run_parallel_sgs_krig(i, gpu_id, full, vario, radius, num_points, begin, rot
     full = full.cuda()
     rotation_matrix = rotation_matrix.cuda()
     
-    curr_offset = begin + i
-
-    loc = full[curr_offset]
-
-    search_candidates = full[:curr_offset]
-
-    near, indicies = nearest_neighbor_search(radius, num_points, loc, search_candidates)
-
-    k_weights, covariance_array = skriging(near, loc, vario, rotation_matrix)
+    kr_dict_subset = {}
     
-    return i, k_weights, covariance_array, indicies
+    for i in i_list:
+    
+        curr_offset = begin + i
+
+        loc = full[curr_offset]
+
+        search_candidates = full[:curr_offset]
+
+        near, indicies = nearest_neighbor_search(radius, num_points, loc, search_candidates)
+
+        k_weights, covariance_array = skriging(near, loc, vario, rotation_matrix)
+        
+        kr_dict_subset[i] = [covariance_array, indicies, k_weights]
+    
+    return kr_dict_subset
 
 
 def skriging(near, loc, vario, rotation_matrix):
