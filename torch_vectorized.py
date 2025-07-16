@@ -19,10 +19,12 @@ import gstatsim_torch as gst
 
 
 def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, num_gpus, multiplier):
+    
+    preprocess_start = time.time()
 
+    # Seperate data into known conditioning data and points to predict
     observed_coords = torch_data[:,:2].tolist()
     simulate_coords = [coord for coord in prediction_grid.tolist() if coord not in observed_coords]
-
     observed_coords = torch.tensor(observed_coords)
     simulate_coords = torch.tensor(simulate_coords)
 
@@ -31,45 +33,64 @@ def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, 
     shuffle = index[torch.randperm(len(simulate_coords))]
     simulate_coords = simulate_coords[shuffle]
 
+    # Create a tensor that has all grid locations with the conditioning data at the beginning
     full = torch.vstack((observed_coords, simulate_coords))
 
+    # Unwrap variogram parameters and make a rotation matrix
     azimuth = vario[0]
     major_range = vario[2]
     minor_range = vario[3]
-
     rotation_matrix = gst.make_rotation_matrix(azimuth, major_range, minor_range, "cpu")
 
-    # create starting index for data from full to use for KNN
+    # Create starting index that marks the beginning of the points to predict
     begin = len(observed_coords)
 
+    # Determine how many points/grid-cells each process will predict 
     num_cells = len(simulate_coords)
     processes = num_gpus * multiplier
     cells_per_process = num_cells//processes
 
+    # Create list of index lists such that each list is for a single process
     i_list = [[i for i in range(j*cells_per_process, (j+1)*cells_per_process)] for j in range(processes-1)]
     i_list.append([i for i in range((processes-1)*cells_per_process,num_cells)])
-
+    
+    # Gather the rest of the arguments to be sent to the function executed in parallel
     gpu_num = [i % num_gpus for i in range(processes)]
-
     args = zip(i_list, gpu_num, itertools.cycle([full]), itertools.cycle([vario]), itertools.cycle([radius]),
                itertools.cycle([num_points]), itertools.cycle([begin]), itertools.cycle([rotation_matrix]))
+    
+    preprocess_end = time.time()
+    
+    print(f"Time to prepare data before parallel execution: {preprocess_end-preprocess_start}s")
+    
+    parallel_start = time.time()
 
-    kr_dictionary = {}
-
+    # use multiprocessing library to execute run_parallel_sgs_krig function in parallel
     mp.set_start_method('spawn', force=True)
-
-    with mp.Pool(processes=num_gpus) as pool:
-        # use python multiprocessing library to execute parallel_krige_sgs function in parallel
+    with mp.Pool(processes=processes) as pool:
+        
         out = pool.starmap(run_parallel_sgs_krig, args)
-
-    # aggregate output into a dictionary to look up data by index
+    
+    # aggregate kriging weight data into a dictionary to look up data by index
+    kr_dictionary = {}
     for kr_dict_subset in out:
 
         kr_dictionary = kr_dictionary | kr_dict_subset
+        
+    parallel_end = time.time()
+    
+    print(f"Time for parallel kriging weight calculations: {parallel_end - parallel_start}")
 
+    prediction_start = time.time()
 
+    # Use kriging dictionary to sequentially predict elevation values for each unknown location
     sgs = pred_Z(kr_dictionary, full, torch_data[:,2], vario, 's')
+    
+    prediction_end = time.time()
+    
+    print(f"Time for serial prediction calculation: {prediction_end - prediction_start}")
 
+    # Sort output to match up with original prediction grid
     sgs = sgs.cpu()
     sgs = sgs[np.lexsort((sgs[:,0], -sgs[:,1]))]
 
@@ -81,13 +102,14 @@ def run_parallel_sgs_krig(i_list, gpu_id, full, vario, radius, num_points, begin
     # Assign the GPU
     torch.cuda.set_device(gpu_id)
     
+    torch.set_num_threads(1)
     torch.cuda.empty_cache()
     
-    # send data to GPU 
+    # Send data to GPU 
     full = full.cuda()
     rotation_matrix = rotation_matrix.cuda()
     
-    # BEGIN VECTORIZED CODE
+    # Create batch tensors
     offset = torch.tensor([i+begin for i in i_list]).cuda()
 
     loc = full[offset]
@@ -96,103 +118,273 @@ def run_parallel_sgs_krig(i_list, gpu_id, full, vario, radius, num_points, begin
     for i, cur_offset in enumerate(offset):
         search_candidates[i, :cur_offset] = full[:cur_offset]
         
-    batch_near, batch_indicies = nearest_neighbor_search(radius, num_points, loc, search_candidates)
-    
-    kr_dict_subset = {}
-    
-    for i, near in enumerate(batch_near):
+    # Add batch dimension to rotation matrix to be used for batch operations
+    batch_rot_mat = rotation_matrix.unsqueeze(0).repeat(len(i_list),1,1)
         
-        #remove NAN values
-        near = near[~torch.isnan(near[:, 0])].reshape(-1,2)
-        indicies = batch_indicies[i][~torch.isnan(batch_indicies[i])]
+    # Perform sorting and initial preperation to collect nearest neighbors
+    stack, indicies, bins, bin_indices, oct_count = preprocess_for_nn_search(search_candidates, loc, radius, num_points)
+    
+    # Go through sorted tensor and collect the k nearest neighbors and their inidices
+    batch_near, batch_indicies = nn_search_vectorized(stack, indicies, bin_indices, bins, num_points, oct_count)
+    
+    # Calcuate covariance matrix
+    covariance_matrix = make_covariance_matrix(batch_near, vario, batch_rot_mat)
 
-        k_weights, covariance_array = skriging(near, loc, vario, rotation_matrix)
+    # Calculate covariance between data and unknown
+    covariance_array = make_covariance_array(batch_near, 
+                    loc.unsqueeze(1).repeat(1, num_points, 1), 
+                    vario, 
+                    batch_rot_mat
+                )
+
+    # Reorder covariance matrix and array so NANs appear at the end
+    sorted_cov_matrix, sorted_cov_array, sorted_indices = reorder(covariance_matrix,
+                                                                    covariance_array,
+                                                                    batch_indicies, num_points)
+
+    # get size list of number of NN collected for future indexing
+    size_list = torch.sum((~torch.isnan(sorted_cov_array)).int(), dim=1)
+
+    # Solve system defined by batch covariance matrix and array to get kriging weights
+    k_weights = solve_system(sorted_cov_matrix, sorted_cov_array, num_points)
+    
+    # Trim based on number of NN and store in dictionary
+    kr_dict_subset = {}
+    for i, true_i in enumerate(i_list):
+
+        trimmed_cov_array = sorted_cov_array[i][:size_list[i]]
+        trimmed_indicies = sorted_indices[i][:size_list[i]]
+        trimmed_weights = k_weights[i][:size_list[i]]
         
-        kr_dict_subset[i] = [covariance_array, indicies, k_weights]
+        kr_dict_subset[true_i] = [trimmed_cov_array, trimmed_indicies, trimmed_weights]
     
     return kr_dict_subset
 
 
-# MOSTLY VECTORIZED NNS
-def nearest_neighbor_search(radius, num_points, loc, data2):
-        
-    locx = loc[:, 0].unsqueeze(1).repeat(1, data2.shape[1])
-    locy = loc[:, 1].unsqueeze(1).repeat(1, data2.shape[1])
+# NNS FUNCTIONS 
+def preprocess_for_nn_search(search_candidates, loc, radius, num_points):
+    """
+    Preprocess input search_candidates and loc 
+    input search_candidates, loc, radius, num_points
+    return:
+        stack
+        indices,
+        bins
+        bin_indices
+        oct_count
+    """
+    B, N, _ = search_candidates.shape
 
-    x_tensor = data2[:, :, 0]
-    y_tensor = data2[:, :, 1]
+    # Repeat loc to align shapes for distance computation
+    locx = loc[:, 0].unsqueeze(1).repeat(1, N)
+    locy = loc[:, 1].unsqueeze(1).repeat(1, N)
 
+    # Extract x/y coordinates
+    x_tensor = search_candidates[:, :, 0]
+    y_tensor = search_candidates[:, :, 1]
+
+    # Compute distance and angle from loc
     centered_x = x_tensor - locx
     centered_y = y_tensor - locy
-
     distances = torch.sqrt(centered_x**2 + centered_y**2)
     angles = torch.atan2(centered_y, centered_x)
 
-    # Stack the tensors into a single tensor
+    # Stack into (B, N, 4): x, y, dist, angle
     stack = torch.stack((x_tensor, y_tensor, distances, angles), dim=2)
 
-    indicies = torch.arange(data2.shape[1]).unsqueeze(0).repeat(data2.shape[0],1).cuda()
+    # Create index tensor (B, N)
+    indices = torch.arange(N, device=stack.device).unsqueeze(0).repeat(B, 1).float()
 
-    # Filter out points outside the radius
-    mask = torch.where((stack[:, :, 2] < radius), 1.0, float('nan')).cuda() 
+    # Mask out points beyond the radius
+    mask = torch.where(distances < radius, 1.0, float('nan'))
     stack = stack * mask.unsqueeze(2).repeat(1, 1, 4)
-    indicies = indicies * mask
+    indices = indices * mask
 
-    # Sort stack and indicies by distance
-    sorted_dist_idxs = torch.argsort(stack[..., 2]).reshape(-1)
-    stack_idxs = (torch.arange(stack.shape[0]).repeat_interleave(stack.shape[1]).reshape(-1))
-    stack = stack[stack_idxs, sorted_dist_idxs, :].reshape(*stack.shape)
-    indicies = indicies[stack_idxs, sorted_dist_idxs].reshape(*indicies.shape)
+    # Sort by distance
+    sorted_dist_idxs = torch.argsort(stack[..., 2], dim=1)
+    stack_idxs = torch.arange(B, device=stack.device).repeat_interleave(N).reshape(B, N)
 
-    # Use bucketize to find bin index for each angle
-    bins = torch.tensor([-math.pi, -3*math.pi/4, -math.pi/2, -math.pi/4, 0,
-                            math.pi/4, math.pi/2, 3*math.pi/4, math.pi]).cuda()
-    bin_indices = torch.bucketize(stack[..., 3].contiguous(), bins, right=False) 
+    # Apply sorting
+    stack = stack.gather(1, sorted_dist_idxs.unsqueeze(-1).expand(-1, -1, 4))
+    indices = indices.gather(1, sorted_dist_idxs)
 
-    # Allocate tensor for the result
-    smallest = torch.full((len(loc), num_points, 2), float('nan')).cuda()
-    index_list = torch.full((len(loc), num_points), float('nan')).cuda()
+    # Define 8 bins over angle range
+    bins = torch.tensor([
+        -math.pi, -3*math.pi/4, -math.pi/2, -math.pi/4, 0,
+         math.pi/4, math.pi/2,  3*math.pi/4, math.pi
+    ], device=stack.device)
+
+    # Bin index based on angle (angle at index 3)
+    bin_indices = torch.bucketize(stack[..., 3], bins, right=False)
+
+    # Octant point count
     oct_count = num_points // 8
 
-    # Remember cant clean up NAN in smallest or index_list because nonequal number of NAN for each row 
+    return stack, indices, bins, bin_indices, oct_count
 
-    for i in range(1, bins.shape[0]):
-        bin_mask = torch.where((bin_indices == i), 1.0, float('nan')).cuda()
-        bin_points = (stack * bin_mask.unsqueeze(2).repeat(1, 1, 4))[..., :2]
-        bin_index = indicies * bin_mask
-        bin_points_count = torch.minimum(torch.tensor([oct_count]).cuda(), torch.sum(~torch.isnan(bin_index), dim=1))
 
-        for j, count in enumerate(bin_points_count): 
-            if count > 0:
+def nn_search_vectorized(stack, indices, bin_indices, bins, num_points, oct_count):
+    '''
+    Vectorized nearest-neighbor search with binning.
 
-                cur_loc_NN = bin_points[j]
-                cur_loc_idx_list = bin_index[j]
+    Parameters:
+    - stack: (B, N, 3), where each point has [x, y, distance]
+    - indices: (B, N), index of each point
+    - bin_indices: (B, N), bin assignment for each point (1 to K)
+    - bins: (K+1,), bin edges
+    - num_points: total points to select per batch (K * oct_count)
+    - oct_count: max number of closest neighbors to select from each bin
 
-                smallest[j, (i-1) * oct_count : (i-1) * oct_count + count, :] = cur_loc_NN[~torch.isnan(cur_loc_NN[:, 0])][:count]
-                index_list[j, (i-1) * oct_count : (i-1) * oct_count + count] = cur_loc_idx_list[~torch.isnan(cur_loc_idx_list)][:count]
+    Returns:
+    - smallest: (B, num_points, 2), selected coordinates
+    - index_list: (B, num_points), selected indices
+    - vec_time: elapsed time for execution
+    '''
+    B, N, _ = stack.shape
+    K = bins.shape[0] - 1  # number of bins
+
+    # === Step 1: Create 3D bin mask ===
+    # bin_mask[b, n, k] = 1 if point n in batch b is in bin k+1
+    bin_mask = (bin_indices.unsqueeze(-1) == torch.arange(1, K+1, device=stack.device)).float()  # (B, N, K)
+    
+    # === Step 2: Apply mask to (x,y) and index values ===
+    nan_mask = bin_mask.masked_fill(bin_mask == 0, float('nan'))  # Replace non-bin entries with NaN
+
+    # Coordinates: (B, N, K, 2)
+    masked_xy = stack[..., :2].unsqueeze(2) * nan_mask.unsqueeze(-1)
+    
+    # Indices: (B, N, K)
+    masked_idx = indices.unsqueeze(2) * nan_mask
+
+    # === Step 3: Count valid points per bin and clamp to oct_count ===
+    is_valid = ~torch.isnan(masked_idx)
+    bin_counts = is_valid.sum(dim=1)  # (B, K)
+    clamped_counts = torch.clamp(bin_counts, max=oct_count)  # (B, K)
+
+    # === Step 4: Sort distances inside bins ===
+    masked_dist = stack[..., 2].unsqueeze(2) * nan_mask  # (B, N, K)
+    sorted_dist, sorted_idx = torch.sort(masked_dist, dim=1)  # (B, N, K)
+    topk_idx = sorted_idx[:, :oct_count, :]  # (B, oct_count, K)
+
+    # === Step 5: Gather top-k points and indices ===
+    b_idx = torch.arange(B, device=stack.device).view(B, 1, 1).expand(B, oct_count, K)
+    k_idx = torch.arange(K, device=stack.device).view(1, 1, K).expand(B, oct_count, K)
+
+    topk_xy = masked_xy[b_idx, topk_idx, k_idx, :]   # (B, oct_count, K, 2)
+    topk_ids = masked_idx[b_idx, topk_idx, k_idx]    # (B, oct_count, K)
+
+    # === Step 6: Mask out unused slots if bin has < oct_count points ===
+    topk_range = torch.arange(oct_count, device=stack.device).view(1, -1, 1)
+    valid_topk_mask = (topk_range < clamped_counts.unsqueeze(1)).float()  # (B, oct_count, K)
+
+    topk_xy *= valid_topk_mask.unsqueeze(-1)
+    topk_ids *= valid_topk_mask
+
+    # === Step 7: Reshape results ===
+    smallest = topk_xy.permute(0, 2, 1, 3).reshape(B, num_points, 2)
+    index_list = topk_ids.permute(0, 2, 1).reshape(B, num_points)
 
     return smallest, index_list
 
+def make_covariance_matrix(smallest, vario, rotation_matrix):
+    """
+    Make covariance matrix showing covariances between each pair of input coordinates
 
-def skriging(near, loc, vario, rotation_matrix):
+    Parameters
+    ----------
+        smallest : (B, num_points, 2)
+        vario : list of variogram parameters [azimuth, nugget, major_range, minor_range, sill, vtype]
+        rotation_matrix : (2,2) matrix used to perform coordinate transformations
+
+    Returns
+    -------
+        covariance_matrix : (B, num_points, num_points) matrix of covariance between n points
+    """
     
-    numpoints = len(near)
+    nug = vario[1]
+    sill = vario[4]
+    vtype = vario[5]
     
-    # covariance between data
-    covariance_matrix = gst.Covariance.make_covariance_matrix(near, vario, rotation_matrix)
+    smallest = smallest.to(dtype=torch.float64)
+    mat = torch.matmul(smallest, rotation_matrix)
+    effective_lag = torch.cdist(mat, mat, p=2)  # Compute pairwise distances
+    covariance_matrix = gst.Covariance.covar(effective_lag, sill, nug, vtype)
+
+    return covariance_matrix
+
+
+def make_covariance_array(coord1, coord2, vario, rotation_matrix):
+    """
+    Make covariance array showing covariances between each data points and grid cell of interest
+
+    Parameters
+    ----------
+        coord1 : numpy.ndarray
+            coordinates of n data points
+        coord2 : numpy.ndarray
+            coordinates of grid cell of interest (i.e. grid cell being simulated) that is repeated n times
+        vario : list
+            list of variogram parameters [azimuth, nugget, major_range, minor_range, sill, vtype]
+            azimuth, nugget, major_range, minor_range, and sill can be int or float type
+            vtype is a string that can be either 'Exponential', 'Spherical', or 'Gaussian'
+        rotation_matrix - rotation matrix used to perform coordinate transformations
+
+    Returns
+    -------
+        covariance_array : numpy.ndarray
+            nx1 array of covariance between n points and grid cell of interest
+    """
+
+    nug = vario[1]
+    sill = vario[4]
+    vtype = vario[5]
+    coord1 = coord1.to(dtype=torch.float64)
+    coord2 = coord2.to(dtype=torch.float64)
+    mat1 = torch.matmul(coord1, rotation_matrix)
+    mat2 = torch.matmul(coord2, rotation_matrix)
+    effective_lag = torch.sqrt(torch.sum((mat1 - mat2).pow(2), dim=2))
     
-    # covariance between data and unknown
-    covariance_array = gst.Covariance.make_covariance_array(
-                    near, 
-                    loc.unsqueeze(0).repeat(numpoints, 1), 
-                    vario, 
-                    rotation_matrix
-                )
+    #Using the Matern Variogram 
     
-    k_weights = torch.linalg.lstsq(covariance_matrix, 
-                                               covariance_array.unsqueeze(-1)).solution.squeeze(-1)
+    covariance_array = gst.Covariance.covar(effective_lag, sill, nug, vtype)
+
+    return covariance_array
+
+
+def reorder(covariance_matrix, covariance_array, index_vec, num_points):
     
-    return k_weights, covariance_array
+    # Get mask to sort batch array and matrix so that nan are at the end
+    nan_mask = torch.isnan(covariance_array)
+    num_mask = ~torch.isnan(covariance_array)
+    nan_indices = torch.nonzero(nan_mask)
+    num_indices = torch.nonzero(num_mask)
+    split_indices = torch.cat((num_indices, nan_indices))
+    reorder_indices = split_indices[split_indices[:, 0].sort()[1]]
+    reorder_indices = reorder_indices[:,1].reshape(covariance_array.shape)
+
+    sorted_cov_array = covariance_array.gather(1, reorder_indices)
+    sorted_index_vec = index_vec.gather(1, reorder_indices)
+
+    reorder_rows = reorder_indices.unsqueeze(-1).repeat(1,1,num_points)
+    reoreder_cols = reorder_indices.unsqueeze(1).repeat(1,num_points,1)
+
+    sorted_cov_matrix = covariance_matrix.gather(1,reorder_rows).gather(2, reoreder_cols)
+    
+    return sorted_cov_matrix, sorted_cov_array, sorted_index_vec
+
+
+def solve_system(sorted_cov_matrix, sorted_cov_array, num_points):
+    
+    # prepare for least squares by converting nan elements to identity
+
+    lstsq_cov_array = sorted_cov_array.nan_to_num(1)
+
+    identity_matrix = torch.eye(num_points, num_points).unsqueeze(0).repeat(len(sorted_cov_array),1,1).cuda()
+    lstsq_cov_matrix = torch.where(torch.isnan(sorted_cov_matrix), identity_matrix, sorted_cov_matrix)
+    
+    k_weights = torch.linalg.lstsq(lstsq_cov_matrix, lstsq_cov_array).solution
+    
+    return k_weights
 
 
 def pred_Z(kr_dictionary, full, df, vario, krig):
@@ -278,20 +470,29 @@ def prepare_data():
     k = 48         # number of neighboring data points used to estimate a given point
     rad = 50000     # 50 km search radius
     
-    return Pred_grid_xy, torch_data, k, vario, rad
+    return Pred_grid_xy, torch_data, k, vario, rad, nst_trans
 
 
 if __name__ == "__main__":
     
-    Pred_grid_xy, torch_data, k, vario, rad = prepare_data()
+    Pred_grid_xy, torch_data, k, vario, rad, nst_trans = prepare_data()
     
     if torch.cuda.is_available():
         
         num_gpus = torch.cuda.device_count()
-        print(num_gpus)
-        multiplier = 16 # This is to avoid CUDA OUT OF MEM ERROR
+        multiplier = 1 # This is to avoid CUDA OUT OF MEM ERROR
+        
+        print("Starting")
+        start_time = time.time()
         
         sgs = skrige_sgs_parallel(Pred_grid_xy, torch_data, k, vario, rad, num_gpus, multiplier)
+        
+        end_time = time.time()
+        print(f"Total time to complete: {end_time-start_time}s")
+        
+        sgs = sgs.reshape(-1,1)
+        sgs_trans = nst_trans.inverse_transform(sgs)
+        torch.save(sgs_trans, "vectorized_sgs.pt")
         
     else: 
         
