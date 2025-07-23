@@ -49,6 +49,8 @@ def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, 
     num_cells = len(simulate_coords)
     processes = num_gpus * multiplier
     cells_per_process = num_cells//processes
+    
+    proc_id = [i for i in range(processes)]
 
     # Create list of index lists such that each list is for a single process
     i_list = [[i for i in range(j*cells_per_process, (j+1)*cells_per_process)] for j in range(processes-1)]
@@ -56,7 +58,7 @@ def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, 
     
     # Gather the rest of the arguments to be sent to the function executed in parallel
     gpu_num = [i % num_gpus for i in range(processes)]
-    args = zip(i_list, gpu_num, itertools.cycle([full]), itertools.cycle([vario]), itertools.cycle([radius]),
+    args = zip(proc_id, i_list, gpu_num, itertools.cycle([full]), itertools.cycle([vario]), itertools.cycle([radius]),
                itertools.cycle([num_points]), itertools.cycle([begin]), itertools.cycle([rotation_matrix]))
     
     preprocess_end = time.time()
@@ -67,15 +69,22 @@ def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, 
 
     # use multiprocessing library to execute run_parallel_sgs_krig function in parallel
     mp.set_start_method('spawn', force=True)
-    with mp.Pool(processes=processes) as pool:
+    with mp.Pool(processes=num_gpus) as pool:
         
         out = pool.starmap(run_parallel_sgs_krig, args)
     
     # aggregate kriging weight data into a dictionary to look up data by index
-    kr_dictionary = {}
-    for kr_dict_subset in out:
+    kr_dictionary = torch.zeros((3, num_cells, num_points)).cuda(0)
+    size_list = torch.zeros(num_cells).cuda(0)
+    
+    for cur_proc_id, kr_dict_subset, cur_size_list in out:
+        
+        begin_i = i_list[cur_proc_id][0]
+        end_i = i_list[cur_proc_id][-1]+1
 
-        kr_dictionary = kr_dictionary | kr_dict_subset
+        kr_dictionary[:, begin_i:end_i, :] = kr_dict_subset.cuda(0)
+        size_list[begin_i:end_i] = cur_size_list.cuda(0)
+        
         
     parallel_end = time.time()
     
@@ -84,7 +93,7 @@ def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, 
     prediction_start = time.time()
 
     # Use kriging dictionary to sequentially predict elevation values for each unknown location
-    sgs = pred_Z(kr_dictionary, full, torch_data[:,2], vario, 's')
+    sgs = pred_Z(kr_dictionary, size_list, full, torch_data[:,2], vario, 's')
     
     prediction_end = time.time()
     
@@ -97,7 +106,7 @@ def skrige_sgs_parallel(prediction_grid, torch_data, num_points, vario, radius, 
     return sgs[:,2]
 
 
-def run_parallel_sgs_krig(i_list, gpu_id, full, vario, radius, num_points, begin, rotation_matrix):
+def run_parallel_sgs_krig(proc_id, i_list, gpu_id, full, vario, radius, num_points, begin, rotation_matrix):
     
     # Assign the GPU
     torch.cuda.set_device(gpu_id)
@@ -109,12 +118,17 @@ def run_parallel_sgs_krig(i_list, gpu_id, full, vario, radius, num_points, begin
     full = full.cuda()
     rotation_matrix = rotation_matrix.cuda()
     
-    # Create batch tensors
+    # Create index list of grid cells to compute
     offset = torch.tensor([i+begin for i in i_list]).cuda()
+    
+    # Get the size of the search matrix 
+    N = int(offset[-1])
 
+    # Create batch location tensor of grid cells to compute
     loc = full[offset]
 
-    search_candidates = torch.full((len(i_list), len(full), 2), float('nan')).cuda()
+    # Create batch location tensor of potential nearest neighbors wrt loc 
+    search_candidates = torch.full((len(i_list), N, 2), float('nan')).cuda()
     for i, cur_offset in enumerate(offset):
         search_candidates[i, :cur_offset] = full[:cur_offset]
         
@@ -142,23 +156,16 @@ def run_parallel_sgs_krig(i_list, gpu_id, full, vario, radius, num_points, begin
                                                                     covariance_array,
                                                                     batch_indicies, num_points)
 
-    # get size list of number of NN collected for future indexing
+    # Get size list of number of NN collected for future indexing
     size_list = torch.sum((~torch.isnan(sorted_cov_array)).int(), dim=1)
 
     # Solve system defined by batch covariance matrix and array to get kriging weights
     k_weights = solve_system(sorted_cov_matrix, sorted_cov_array, num_points)
     
-    # Trim based on number of NN and store in dictionary
-    kr_dict_subset = {}
-    for i, true_i in enumerate(i_list):
-
-        trimmed_cov_array = sorted_cov_array[i][:size_list[i]]
-        trimmed_indicies = sorted_indices[i][:size_list[i]]
-        trimmed_weights = k_weights[i][:size_list[i]]
-        
-        kr_dict_subset[true_i] = [trimmed_cov_array, trimmed_indicies, trimmed_weights]
+    # Store results in a batch "dictionary" tensor    
+    kr_dict_subset = torch.stack((sorted_cov_array, sorted_indices, k_weights))
     
-    return kr_dict_subset
+    return proc_id, kr_dict_subset, size_list
 
 
 # NNS FUNCTIONS 
@@ -387,9 +394,12 @@ def solve_system(sorted_cov_matrix, sorted_cov_array, num_points):
     return k_weights
 
 
-def pred_Z(kr_dictionary, full, df, vario, krig):
+def pred_Z(kr_dictionary, size_list, full, df, vario, krig):
     
     torch.cuda.set_device(0)
+    
+    torch.set_num_threads(1)
+    torch.cuda.empty_cache()
                  
     z_mean = torch.mean(df).cuda()
     z_lookup = torch.zeros(len(full)).cuda()
@@ -397,15 +407,15 @@ def pred_Z(kr_dictionary, full, df, vario, krig):
     
     for i in range(len(full) - len(df)):
         
-        covariance_array, indicies, weights = kr_dictionary[i]
+        covariance_array, indicies, weights = kr_dictionary[:,i,:int(size_list[i])]
         near_ele = torch.tensor([z_lookup[int(idx)] for idx in indicies]).cuda()
                                 
         if krig == 'o':
             z_mean = torch.mean(near_ele)
         
         # calculate kriging mean and variance
-        est = z_mean + torch.dot(weights[:len(near_ele)].squeeze().cuda(), (near_ele - z_mean).to(dtype=torch.float64))
-        var = torch.abs(vario[4] - torch.dot(weights[:len(near_ele)].squeeze().cuda(), covariance_array[:len(near_ele)].cuda()))
+        est = z_mean + torch.dot(weights[:len(near_ele)].squeeze(), (near_ele - z_mean))
+        var = torch.abs(vario[4] - torch.dot(weights[:len(near_ele)].squeeze(), covariance_array[:len(near_ele)]))
         
         z_lookup[len(df) + i] = torch.normal(est,torch.sqrt(var))
     
@@ -480,7 +490,7 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         
         num_gpus = torch.cuda.device_count()
-        multiplier = 1 # This is to avoid CUDA OUT OF MEM ERROR
+        multiplier = 20 # This is to avoid CUDA OUT OF MEM ERROR
         
         print("Starting")
         start_time = time.time()
