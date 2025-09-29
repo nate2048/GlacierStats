@@ -29,11 +29,19 @@ if __name__ == "__main__":
     x_cond = torch.from_numpy(xx[cond_msk])
     y_cond = torch.from_numpy(yy[cond_msk])
     data_cond = torch.from_numpy(bed_cond[cond_msk] - bedmap.trend.values[cond_msk])
+    
+    # Create index map 
+    index_map = cond_msk.astype(int).copy()
+    true_indicies = np.where(cond_msk)
+    index_map[true_indicies] = np.arange(len(true_indicies[0]))
+    index_map = np.where(cond_msk, index_map, float('nan'))
+    index_map = torch.from_numpy(index_map)
 
     # Mask out simulation coordinates
     sim_mask = ~cond_msk * ice_rock_msk
     x_sim = torch.from_numpy(xx[sim_mask])
     y_sim = torch.from_numpy(yy[sim_mask])
+    
     # Mask out simulation variogram params
     azimuth_arr = torch.from_numpy(vario_params.azimuth.values[sim_mask])
     nugget_arr = torch.zeros(azimuth_arr.shape)
@@ -43,20 +51,23 @@ if __name__ == "__main__":
     smooth_arr = torch.from_numpy(vario_params.smooth.values[sim_mask])
 
     # Make torch tensors
-    xy_cond = torch.cat((x_cond.unsqueeze(1), x_cond.unsqueeze(1)), dim=1)
+    x = torch.from_numpy(np.array(bedmap.x))
+    y = torch.from_numpy(np.array(bedmap.y))
+    xy_cond = torch.cat((x_cond.unsqueeze(1), y_cond.unsqueeze(1)), dim=1)
+    cond_mask = torch.from_numpy(cond_msk)
     xy_sim = torch.cat((x_sim.unsqueeze(1), y_sim.unsqueeze(1)), dim=1)
     vario_sim = torch.cat((azimuth_arr.unsqueeze(1), nugget_arr.unsqueeze(1), major_range_arr.unsqueeze(1), 
                            minor_range_arr.unsqueeze(1), sill_arr.unsqueeze(1), smooth_arr.unsqueeze(1)), dim=1)
     
-    k = 24          # number of neighboring data points used to estimate a given point
-    rad = 50000     # 50 km search radius
+    num_nn = 24          # number of neighboring data points used to estimate a given point
+    bb_size = 14
     
     num_gpus = torch.cuda.device_count()
-    multiplier = 800_000 # This is to avoid CUDA OUT OF MEM ERROR
+    multiplier = 20 # This is to avoid CUDA OUT OF MEM ERROR
         
     start_time = time.time()
         
-    sgs = torch_vectorized.skrige_sgs(xy_cond, data_cond, xy_sim, vario_sim, k, rad, num_gpus, multiplier)
+    sgs = torch_vectorized.skrige_sgs(x, y, xy_cond, data_cond, cond_mask, index_map, xy_sim, sim_mask, vario_sim, num_nn, bb_size, num_gpus, multiplier)
 
     end_time = time.time()
     print(f"Total time to complete: {end_time-start_time}s")

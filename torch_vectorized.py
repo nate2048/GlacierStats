@@ -17,8 +17,16 @@ import torch
 import random
 torch.set_default_dtype(torch.float32)
 
+############################## Size Key ##############################
+# C: Number of gridded conditioning data points
+# S: Number of points on the grid that need to be simulated 
+# B: Number of points that are being processed in current batch
+# K: Number of radial segments in NNS (default 8 for octant search)
+# X: List of coordinates along the x axis of the full grid
+# Y: List of coordinates alogn the y axis of the full grid 
 
-def skrige_sgs(xy_cond, data_cond, xy_sim, vario_sim, num_nn, radius, num_gpus, multiplier):
+
+def skrige_sgs(x, y, xy_cond, data_cond, cond_mask, index_map, xy_sim, sim_mask, vario_sim, num_nn, bb_size, num_gpus, multiplier):
     '''
     Launch function for gpu-accelerated Simple Kriging with multiprocessing and batch (vectorized) code
 
@@ -26,7 +34,8 @@ def skrige_sgs(xy_cond, data_cond, xy_sim, vario_sim, num_nn, radius, num_gpus, 
     - xy_cond: tensor(C, 2), conditioning data locations
     - data_cond: tensor(C,), elevation values that coorespond to conditioning data locations
     - xy_sim: tensor(S, 2), locations to be simulated
-    - vario_sim: tensor(S, 6), variogram params for each location to be simulated [azimuth, nugget, major_range, minor_range, sill, smooth]
+    - vario_sim: tensor(S, 6), variogram params for each location to be simulated 
+                                [azimuth, nugget, major_range, minor_range, sill, smooth]
     - num_nn: int, maximum number of nearest neigbors
     - radius: int, nearest neigbor search radius
     - num_gpus: int, number of available gpus (torch.cuda.device_count())
@@ -64,11 +73,13 @@ def skrige_sgs(xy_cond, data_cond, xy_sim, vario_sim, num_nn, radius, num_gpus, 
     # Create list of variogram parameter tensors that cooresponds to the simulation partition
     vario_list = [vario_sim_shuffled[j*cells_per_process: (j+1)*cells_per_process] for j in range(processes-1)]
     vario_list.append(vario_sim_shuffled[(processes-1)*cells_per_process: num_cells])
+
     
     # Gather the rest of the arguments to be sent to the function executed in parallel
     gpu_num = [i % num_gpus for i in range(processes)]
-    args = zip(proc_id, i_list, vario_list, gpu_num, itertools.cycle([full]), itertools.cycle([radius]),
-               itertools.cycle([num_nn]), itertools.cycle([begin]))
+    args = zip(proc_id, i_list, vario_list, gpu_num, itertools.cycle([cond_mask]), itertools.cycle([sim_mask]),
+               itertools.cycle([index_map]), itertools.cycle([x]), itertools.cycle([y]), itertools.cycle([shuffle]),
+               itertools.cycle([full]), itertools.cycle([num_nn]), itertools.cycle([begin]), itertools.cycle([bb_size]))
     
     preprocess_end = time.time()
     
@@ -78,7 +89,7 @@ def skrige_sgs(xy_cond, data_cond, xy_sim, vario_sim, num_nn, radius, num_gpus, 
 
     # use multiprocessing library to execute parallel_skring_weights function in parallel
     mp.set_start_method('spawn', force=True)
-    with mp.Pool(processes=num_gpus) as pool:
+    with mp.Pool(processes=1) as pool:
         
         out = pool.starmap(parallel_skring_weights, tqdm.tqdm(args, total=len(proc_id)))
     
@@ -116,14 +127,15 @@ def skrige_sgs(xy_cond, data_cond, xy_sim, vario_sim, num_nn, radius, num_gpus, 
     return sgs
 
 
-def parallel_skring_weights(proc_id, i_list, batch_vario, gpu_id, full, radius, num_nn, begin):
+def parallel_skring_weights(proc_id, i_list, batch_vario, gpu_id, cond_mask, sim_mask, index_map, x, y, shuffle, full, num_nn, begin, bb_size):
     '''
     Function with vectorized code to compute the (simple) Kriging weights for a batch of simulation locations
 
     Parameters:
     - proc_id: int, process number to corroborate results
     - i_list: list(B), index list to create a slice from full to get current batch locations
-    - batch_vario: tensor(B, 6), variogram parameters that coorespond to current batch [azimuth, nugget, major_range, minor_range, sill, smooth]
+    - batch_vario: tensor(B, 6), variogram parameters that coorespond to current batch 
+                                [azimuth, nugget, major_range, minor_range, sill, smooth]
     - gpu_id: int, number to indicate which device should be used to process current batch
     - full: tensor(C+S, 2), all grid locations with the conditioning data at the beginning 
     - radius: int, nearest neigbor search radius
@@ -147,6 +159,10 @@ def parallel_skring_weights(proc_id, i_list, batch_vario, gpu_id, full, radius, 
     # Send data to GPU 
     full = full.cuda()
     batch_vario = batch_vario.cuda()
+    cond_mask = cond_mask.cuda()
+    index_map = index_map.cuda()
+    x = x.cuda()
+    y = y.cuda()
     
     # Create index list of grid cells to compute
     offset = torch.tensor([i+begin for i in i_list]).cuda()
@@ -159,14 +175,15 @@ def parallel_skring_weights(proc_id, i_list, batch_vario, gpu_id, full, radius, 
 
     # Create batch location tensor of grid cells to compute
     loc = full[offset]
-
-    # Create batch location tensor of potential nearest neighbors wrt loc 
-    search_candidates = torch.full((B, N, 2), float('nan'), device=device)
-    for i, cur_offset in enumerate(offset):
-        search_candidates[i, :cur_offset] = full[:cur_offset]
+    
+    # Update conditioning and index map to reflect locations that were processed in prior batches
+    new_cond_mask, new_index_map = update_masks(x, y, cond_mask, sim_mask, index_map, shuffle, begin, i_list)
+    
+    # Get reduced list of NN condidates by taking a square segment of the full grid 
+    potential_nn, potential_indicies = reduce_nn_seach_candidates(x, y, full, B, new_cond_mask, new_index_map, begin+i_list[0], bb_size)
         
     # Perform sorting and initial preperation to collect nearest neighbors
-    stack, indicies, bins, bin_indices, oct_count = preprocess_for_nn_search(search_candidates, loc, radius, num_nn)
+    stack, indicies, bins, bin_indices, oct_count = preprocess_for_nn_search(potential_nn, potential_indicies, loc, num_nn)
     
     # Go through sorted tensor and collect the k nearest neighbors and their inidices
     batch_near, batch_indicies = nn_search_vectorized(stack, indicies, bin_indices, bins, num_nn, oct_count)
@@ -204,21 +221,165 @@ def parallel_skring_weights(proc_id, i_list, batch_vario, gpu_id, full, radius, 
     return proc_id, kr_dict_subset, size_list
 
 
-def preprocess_for_nn_search(search_candidates, loc, radius, num_nn):
+def update_masks(x, y, cond_mask, sim_mask, index_map, shuffle, begin, i_list):
+    '''
+    Updates conditioning data mask and index map to reflect all the locations that were processes in previous batches 
+
+    Parameters:
+    - x: tensor(X,), grid locations along the x-axis
+    - y: tensor(Y,), grid locations along the y-axis
+    - cond_mask: tensor(Y, X), binary mask where 1 denotes locations of original conditioning data 
+    - sim_mask: tensor(Y, X), binary mask where 1 denotes locations that need to be simulated  
+    - index_map: tensor(Y, X), mask of conditing data where non NAN values coorespond to the index location in full 
+    - shuffle: tensor(S,), tensor used to shuffle simulation data locations to create random path
+    - begin: int, starting index that marks the beginning of the points to simulate
+    - i_list: list(B), index list to create a slice from full to get current batch locations
+
+    Returns:
+    - new_cond_mask: tensor(Y, X), binary mask where 1 denotes locations of original conditioning data as well as 
+                                simulation locations processed in previous batches
+    - new_index_map: tensor(Y, X), mask of conditing data and previously processed locations where non NAN values 
+                                coorespond to the index location in full 
+    '''
+
+    # Create index map in same shape as original grid and gather simulation index coordinates
+    ii, jj = torch.meshgrid(torch.arange(x.shape[0]), torch.arange(y.shape[0]), indexing='ij')
+    ii_sim = ii[sim_mask]
+    jj_sim = jj[sim_mask]
+    ij_sim = torch.cat((ii_sim.unsqueeze(1), jj_sim.unsqueeze(1)), dim=1).to(torch.int32)
+    
+    # Shuffle simulation index coordates in same way the true coordinates were shuffled
+    ij_sim_shuffled = ij_sim[shuffle]
+
+    new_cond_mask = cond_mask.detach().clone()
+    new_index_map = index_map.detach().clone()
+    
+    # Note first value in i list is the number of locations that were processed in prior batch(es)
+    for i in range(i_list[0]):
+
+        i_sim, j_sim = ij_sim_shuffled[i].tolist()
+
+        # Add point and index to conditioning data
+        new_cond_mask[i_sim, j_sim] = True
+        new_index_map[i_sim, j_sim] = begin + i
+        
+    return new_cond_mask, new_index_map
+
+
+def reduce_nn_seach_candidates(x, y, full, B, cond_mask, index_map, begin_batch, bb_size):
+    '''
+    Reduces search candidates for NNS by taking a square cut out of size (bb_size)x(bb_size) that surrounds each
+    simulation location in the current batch and creates a list of potential NN that reside in the square 
+
+    Parameters:
+    - x: tensor(X,), grid locations along the x-axis
+    - y: tensor(Y,), grid locations along the y-axis
+    - full: tensor(C+S, 2), all grid locations with the conditioning data at the beginning 
+    - B: int, batch size
+    - cond_mask: tensor(Y, X), binary mask where 1 denotes locations of original conditioning data as well as 
+                                simulation locations processed in previous batches
+    - index_map: tensor(Y, X), mask of conditing data and previously processed locations where non NAN values 
+                                coorespond to the index location in full 
+    - begin_batch: int, starting index that marks the beginning of the points to simulate in the current batch
+    - bb_size: int, size of square cut out (larger bb_size requires more memory in NNS)
+
+    Returns:
+    - potential_NN: tensor(B, bb_size^2, 2), list of potential NN locations for each location in current batch
+    - potential_indicies: tensor(B, bb_size^2), list of potential NN indicies for each location in current batch
+    '''
+    
+    xx, yy = torch.meshgrid(x,y, indexing='ij')
+    
+    # Mask out locations not part of conditioning data
+    nan_cond_mask = torch.where(cond_mask, 1, float('nan'))
+    xx_cond = xx * nan_cond_mask
+    yy_cond = yy * nan_cond_mask
+    
+    potential_NN = torch.full((B, bb_size ** 2, 2), float('nan')).cuda()
+    potential_indicies = torch.full((B, bb_size ** 2), float('nan')).cuda()
+    
+    vert_max = xx.shape[0]
+    horiz_max = xx.shape[1]
+    loop_iter = 0
+    sim_offset = begin_batch
+    
+    for i in range(B):
+        
+        x_sim, y_sim = full[i+sim_offset].tolist()
+        
+        # Find grid index of current location being processed
+        i_sim = int((x == x_sim).nonzero(as_tuple=False)[0])
+        j_sim = int((y == y_sim).nonzero(as_tuple=False)[0])
+        
+        pad_size = int(bb_size / 2)
+        num_potential_NN = 0
+        
+        while num_potential_NN < 8:
+
+            # Create index bounds for bounding box centered on current location
+            nb = i_sim - pad_size; sb = i_sim + pad_size
+            wb = j_sim - pad_size; eb = j_sim + pad_size
+
+            # Edge correction 
+            if(nb < 0):
+                sb = sb - nb
+                nb = 0 
+            elif(sb >= vert_max):
+                nb = nb - (sb - vert_max - 1)
+                sb = vert_max - 1
+            elif(wb < 0):
+                eb = eb - wb
+                wb = 0
+            elif(eb >= horiz_max):
+                wb = wb - (eb - horiz_max - 1)
+                eb = horiz_max - 1
+
+            # Square slice to retrieve potential NN locations and indicies
+            x_locs = xx_cond[nb:sb, wb:eb]
+            y_locs = yy_cond[nb:sb, wb:eb]
+            indicies = index_map[nb:sb, wb:eb]
+
+            # Check to see how many potential NN exist withing bounding box
+            num_potential_NN = torch.count_nonzero(~torch.isnan(x_locs.flatten()))
+
+            # Increase pad size if while loop condition not satisfied 
+            pad_size = pad_size * 2
+            
+        # Add point and index to conditioning data
+        xx_cond[i_sim, j_sim] = x_sim
+        yy_cond[i_sim, j_sim] = y_sim
+        index_map[i_sim, j_sim] = i + sim_offset
+        
+        x_NN = x_locs[~torch.isnan(x_locs)]
+        y_NN = y_locs[~torch.isnan(x_locs)]
+        indicies_NN = indicies[~torch.isnan(x_locs)]
+
+        # Correction if bounding box size was increased due to insuficient number of neighbors 
+        if num_potential_NN > (bb_size ** 2):
+            num_potential_NN = (bb_size ** 2)
+
+        potential_NN[i, :num_potential_NN] = torch.cat((x_NN.unsqueeze(1), y_NN.unsqueeze(1)), dim=1)[:num_potential_NN]
+        potential_indicies[i, :num_potential_NN] = indicies_NN[:num_potential_NN]
+        
+    return potential_NN, potential_indicies
+    
+
+
+def preprocess_for_nn_search(search_candidates, indicies, loc, num_nn):
     '''
     Prepare data for nearest-neighbor search with binning.
 
     Parameters:
-    - search_candidates: (B, N, 2), potential NN locations wrt each batch location (grows larger for points further down simualtion path)
+    - search_candidates: tensor(B, bb_size^2, 2), potential NN locations wrt each batch location 
+    - indicies: tensor(B, bb_size^2), list of potential NN indicies that is 1-1 with search_candidates
     - loc: tensor(B, 2), all the current batch locations
-    - radius: int, nearest neigbor search radius
     - num_nn: int, maximum number of nearest neigbors
 
     Returns:
-    - stack: (B, N, 3), where each potential nearest neighbor has [x, y, distance, angle]
-    - indices: tensor(B, N), index of each potential nearest neighbor 
+    - stack: (B, bb_size^2, 4), where each potential nearest neighbor has [x, y, distance, angle]
+    - indices: tensor(B, bb_size^2), index of each potential nearest neighbor 
     - bins: list(K+1,), bin edges
-    - bin_indices: tensor(B, N), bin assignment for each point (1 to K)
+    - bin_indices: tensor(B, bb_size^2), bin assignment for each point (1 to K)
     - oct_count: int, max number of closest neighbors to select from each bin
     '''
     B, N, _ = search_candidates.shape
@@ -240,21 +401,13 @@ def preprocess_for_nn_search(search_candidates, loc, radius, num_nn):
     # Stack into (B, N, 4): x, y, dist, angle
     stack = torch.stack((x_tensor, y_tensor, distances, angles), dim=2)
 
-    # Create index tensor (B, N)
-    indices = torch.arange(N, device=stack.device).unsqueeze(0).repeat(B, 1).float()
-
-    # Mask out points beyond the radius
-    # mask = torch.where(distances < radius, 1.0, float('nan'))
-    # stack = stack * mask.unsqueeze(2).repeat(1, 1, 4)
-    # indices = indices * mask
-
     # Sort by distance
     sorted_dist_idxs = torch.argsort(stack[..., 2], dim=1)
     stack_idxs = torch.arange(B, device=stack.device).repeat_interleave(N).reshape(B, N)
 
     # Apply sorting
     stack = stack.gather(1, sorted_dist_idxs.unsqueeze(-1).expand(-1, -1, 4))
-    indices = indices.gather(1, sorted_dist_idxs)
+    indicies = indicies.gather(1, sorted_dist_idxs)
 
     # Define 8 bins over angle range
     bins = torch.tensor([
@@ -268,7 +421,7 @@ def preprocess_for_nn_search(search_candidates, loc, radius, num_nn):
     # Octant point count
     oct_count = num_nn // 8
 
-    return stack, indices, bins, bin_indices, oct_count
+    return stack, indicies, bins, bin_indices, oct_count
 
 
 def nn_search_vectorized(stack, indices, bin_indices, bins, num_nn, oct_count):
@@ -276,9 +429,9 @@ def nn_search_vectorized(stack, indices, bin_indices, bins, num_nn, oct_count):
     Vectorized nearest-neighbor search with binning.
 
     Parameters:
-    - stack: tensor(B, N, 4), where each potential nearest neighbor has [x, y, distance, angle]
-    - indices: tensor(B, N), index of each potential nearest neighbor 
-    - bin_indices: tensor(B, N), bin assignment for each point (1 to K)
+    - stack: tensor(B, bb_size^2, 4), where each potential nearest neighbor has [x, y, distance, angle]
+    - indices: tensor(B, bb_size^2), index of each potential nearest neighbor 
+    - bin_indices: tensor(B, bb_size^2), bin assignment for each point (1 to K)
     - bins: list(K+1,), bin edges
     - num_nn: int, total points to select per batch (K * oct_count)
     - oct_count: int, max number of closest neighbors to select from each bin
